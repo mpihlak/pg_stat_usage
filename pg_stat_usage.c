@@ -15,35 +15,6 @@
 
 PG_MODULE_MAGIC;
 
-void _PG_init(void);
-void _PG_fini(void);
-
-static void report_stat(void);
-static void start_function_stat(FunctionCallInfoData *fcinfo, PgStat_FunctionCallUsage *fcu);
-static void end_function_stat(PgStat_FunctionCallUsage *fcu, bool finalize);
-static void start_table_stat(Relation rel);
-
-static report_stat_hook_type			prev_report_stat_hook = NULL;
-static start_function_stat_hook_type	prev_start_function_stat_hook = NULL;
-static end_function_stat_hook_type		prev_end_function_stat_hook = NULL;
-static start_table_stat_hook_type		prev_start_table_stat_hook = NULL;
-
-static bool 	track_function_calls = false;
-static bool 	track_call_graph = false;
-static bool 	track_table_stats = false;
-
-static Oid 		current_function_oid = InvalidOid;
-static Oid 		current_function_parent = InvalidOid;
-static int		current_depth = 0;
-
-static HTAB    *function_usage_tab = NULL;
-
-/*
- * We need to track the oid of current function call. Keep this in a stack until a
- * better idea comes along.
- */
-static List	   *call_stack = NIL;
-
 /* 
  * Key into parent/child function call hash table
  */
@@ -54,15 +25,81 @@ typedef struct FunctionUsageKey
 } FunctionUsageKey;
 
 /*
+ * Counters for tracking function usage
+ */
+typedef struct FunctionUsageCounters
+{
+	PgStat_Counter		num_calls;
+	PgStat_Counter		total_time;
+	PgStat_Counter		self_time;
+} FunctionUsageCounters;
+
+/*
  * Essential information about the tracked functions.
  */
 typedef struct BackendFunctionCallInfo
 {
-	FunctionUsageKey	f_key;
-	int					f_nargs;
-	char			   *f_schema;
-	char			   *f_name;
+	FunctionUsageKey		f_key;
+	FunctionUsageCounters	f_counters;
+	int						f_nargs;
+	char				   *f_schema;
+	char				   *f_name;
 } BackendFunctionCallInfo;
+
+/* 
+ * Key into table/funccontext hash table
+ */
+typedef struct TableUsageKey
+{
+	Oid						t_id;
+	Oid						t_func_context;
+} TableUsageKey;
+
+/*
+ * Track table usage counters. Basically same as Relation structure has, but also
+ * keep function call context (if there is any).
+ */
+typedef struct TableUsageInfo
+{
+	TableUsageKey			t_key;
+	char				   *t_name;
+	char				   *t_schema;
+	char				 	t_relkind;
+	PgStat_TableCounts	   *t_counters;
+} TableUsageInfo;
+
+void _PG_init(void);
+void _PG_fini(void);
+static void report_stat(void);
+static void start_function_stat(FunctionCallInfoData *fcinfo, PgStat_FunctionCallUsage *fcu);
+static void end_function_stat(PgStat_FunctionCallUsage *fcu, bool finalize);
+static void start_table_stat(Relation rel);
+
+static report_stat_hook_type			prev_report_stat_hook = NULL;
+static start_function_stat_hook_type	prev_start_function_stat_hook = NULL;
+static end_function_stat_hook_type		prev_end_function_stat_hook = NULL;
+static start_table_stat_hook_type		prev_start_table_stat_hook = NULL;
+
+static Oid 		current_function_oid = InvalidOid;
+static Oid 		current_function_parent = InvalidOid;
+static int		current_depth = 0;
+
+/*
+ * This holds the call statistics for parent/func pairs.
+ */
+static HTAB    *function_usage_tab = NULL;
+
+/*
+ * This is for the relation's stats
+ */
+static HTAB	   *relation_usage_tab = NULL;
+
+/*
+ * We need to track the oid of current function call. Keep this in a stack until a
+ * better idea comes along.
+ */
+static List	   *call_stack = NIL;
+
 
 /*
  * Module Load Callback
@@ -70,39 +107,6 @@ typedef struct BackendFunctionCallInfo
 void
 _PG_init(void)
 {
-	DefineCustomBoolVariable("pg_stat_usage.track_function_calls",
-			"Selects whether function calls are tracked by pg_stat_usage",
-			NULL,
-			&track_function_calls,
-			true,
-			PGC_SUSET,
-			0,
-			NULL,
-			NULL,
-			NULL);
-
-	DefineCustomBoolVariable("pg_stat_usage.track_call_graph",
-			"Selects whether function call graph is tracked by pg_stat_usage",
-			NULL,
-			&track_call_graph,
-			true,
-			PGC_SUSET,
-			0,
-			NULL,
-			NULL,
-			NULL);
-
-	DefineCustomBoolVariable("pg_stat_usage.track_table_stats",
-			"Selects whether table and index stats are tracked by pg_stat_usage",
-			NULL,
-			&track_table_stats,
-			true,
-			PGC_SUSET,
-			0,
-			NULL,
-			NULL,
-			NULL);
-
 	/* Install Hooks */
 	prev_report_stat_hook = report_stat_hook;
 	report_stat_hook = report_stat;
@@ -131,14 +135,61 @@ void _PG_fini(void)
 	start_table_stat_hook = prev_start_table_stat_hook;
 }
 
+/*
+ * Called, when the backend wants to send its accumulated stats to the collector.
+ *
+ * NB! This is performed outside of a transaction. No syscache lookups here.
+ */
 static void report_stat(void)
 {
+	BackendFunctionCallInfo	   *bfci;
+	TableUsageInfo			   *tui;
+	HASH_SEQ_STATUS				hstat;
+
+	elog(LOG, "Reporting accumulated statistics.");
+
+	if (function_usage_tab)
+	{
+		hash_seq_init(&hstat, function_usage_tab);
+		while ((bfci = hash_seq_search(&hstat)) != NULL)
+		{
+			elog(LOG, "function call: %s.%s(%d) oid=%u parent=%u calls=%lu",
+					bfci->f_schema,
+					bfci->f_name,
+					bfci->f_nargs,
+					bfci->f_key.f_kid,
+					bfci->f_key.f_parent,
+					bfci->f_counters.num_calls);
+			/* 
+			 * Reset the counters after reporting so that any downstream
+			 * collectors are not accounting double.
+			 */
+			MemSet(&bfci->f_counters, 0, sizeof(bfci->f_counters));
+		}
+	}
+
+	if (relation_usage_tab)
+	{
+		hash_seq_init(&hstat, relation_usage_tab);
+		while ((tui = hash_seq_search(&hstat)) != NULL)
+		{
+			/*
+			 * XXX: the stat's system has already reset the counters and we're reporting zeros here :(
+			 * Might need to move the stats hook to earlier in the function.
+			 */
+			if (tui->t_counters)
+			{
+				elog(LOG, "table access: %s.%s oid=%u function=%u scans=%lu",
+					tui->t_schema, tui->t_name, tui->t_key.t_id, tui->t_key.t_func_context,
+					tui->t_counters->t_numscans);
+				tui->t_counters = NULL;
+			}
+		}
+	}
 }
 
 /* 
- * Register the function in our internal tables
- * Look up the name of the function (local cache and syscache, if not local)
- * Track parent/child relationships
+ * Called when the backend starts to track the counters for a function.
  *
  * Note that this will only fire when track_function calls is set to an appropriate level.
  */
@@ -171,7 +222,7 @@ static void start_function_stat(FunctionCallInfoData *fcinfo, PgStat_FunctionCal
 	if (!found)
 	{
 		/* 
-		 * A unique parent/kid combination. Set up BackendFunctionCallInfo.
+		 * Ah, a new parent/kid combination. Set up BackendFunctionCallInfo for it.
 		 * TODO: Measure if it makes sense to cache the name lookups in a HTAB
 		 */
 		Form_pg_proc functup;
@@ -189,13 +240,22 @@ static void start_function_stat(FunctionCallInfoData *fcinfo, PgStat_FunctionCal
 		bfci->f_name = pstrdup(NameStr(functup->proname));
 		bfci->f_schema = get_namespace_name(functup->pronamespace);
 		bfci->f_nargs = functup->pronargs;
+		MemSet(&bfci->f_counters, 0, sizeof(bfci->f_counters));
  
 		ReleaseSysCache(tp);
 	} 
 
+	/*
+	 * TODO: Update the counters and start the timers.
+	 */
+	bfci->f_counters.num_calls++;
+
+#if 0
 	elog(INFO, "START: function %s.%s(%d) oid=%u parent=%u grandparent=%u", 
 		bfci->f_schema, bfci->f_name, bfci->f_nargs,
 		key.f_kid, key.f_parent, current_function_parent);
+#endif
+
 	current_depth++;
 
 	call_stack = lcons_oid(current_function_parent, call_stack);
@@ -230,9 +290,12 @@ static void end_function_stat(PgStat_FunctionCallUsage *fcu, bool finalize)
 	current_function_oid = key.f_parent;
 	current_function_parent = linitial_oid(call_stack);
 
+#if 0
 	elog(INFO, "END: function %s.%s(%d) oid=%u parent=%u grandparent=%u", 
 		bfci->f_schema, bfci->f_name, bfci->f_nargs,
 		key.f_kid, key.f_parent, current_function_parent);
+#endif
+
 	current_depth--;
 
 	call_stack = list_delete_first(call_stack);
@@ -240,7 +303,70 @@ static void end_function_stat(PgStat_FunctionCallUsage *fcu, bool finalize)
 	MemoryContextSwitchTo(oldctx);
 }
 
+/*
+ * Called when the backend wants to add some stats to a relation.
+ *
+ * We only try to look at non-system objects.
+ */
 static void start_table_stat(Relation rel)
 {
+	TableUsageKey		key;
+	MemoryContext 		oldctx;
+	TableUsageInfo	   *tui;
+	Form_pg_class 		reltup;
+	HeapTuple			tp;
+	bool				found;
+
+	if (!rel->pgstat_info)
+		return;
+
+	if (rel->rd_id < FirstNormalObjectId)
+		/* Skip system objects for now */
+		return;
+
+	oldctx = MemoryContextSwitchTo(TopMemoryContext);
+
+	key.t_id = rel->rd_id;
+	key.t_func_context = current_function_oid;
+
+	if (!relation_usage_tab)
+	{
+		/* First time through, set up the functions hash table */
+ 		HASHCTL hash_ctl;
+ 
+ 		memset(&hash_ctl, 0, sizeof(hash_ctl));
+		hash_ctl.keysize = sizeof(key);
+ 		hash_ctl.entrysize = sizeof(TableUsageInfo);
+		hash_ctl.hash = tag_hash;
+ 		relation_usage_tab = hash_create("Table stat entries", 512, &hash_ctl, HASH_ELEM | HASH_BLOBS);
+	}
+
+	tui = hash_search(relation_usage_tab, &key, HASH_ENTER, &found);
+
+	if (!found)
+	{
+		tp = SearchSysCache(RELOID, ObjectIdGetDatum(rel->rd_id), 0, 0, 0);
+	
+		if (!HeapTupleIsValid(tp))
+			ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				errmsg("relation \"%u\" does not exist", rel->rd_id)));
+	
+		reltup = (Form_pg_class) GETSTRUCT(tp);
+	
+		tui->t_name = pstrdup(NameStr(reltup->relname));
+		tui->t_schema = get_namespace_name(reltup->relnamespace);
+		tui->t_relkind = reltup->relkind;
+
+		ReleaseSysCache(tp);
+	} 
+
+	tui->t_counters = &rel->pgstat_info->t_counts;
+
+#if 1
+	elog(INFO, "TSTART: table %s.%s oid=%u func=%u", tui->t_schema, tui->t_name, key.t_id, current_function_oid);
+#endif
+
+	MemoryContextSwitchTo(oldctx);
 }
 

@@ -20,9 +20,14 @@ begin
 end;
 $$ language plpgsql;
 
+drop table t_test;
+create table t_test (
+i integer primary key
+);
+
 create or replace function qux() returns void as
 $$
 begin
-	null;
+	perform count(*) from t_test;
 end;
 $$ language plpgsql;

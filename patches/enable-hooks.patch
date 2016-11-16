@@ -1,0 +1,97 @@
+commit 450c7e4371dc71e2ac2dd05cfc0060246af9a724
+Author: Martin Pihlak <martin.pihlak@gmail.com>
+Date:   Wed Nov 16 11:32:22 2016 +0200
+
+    Hooks enabling extending the stats collector.
+    
+    Enabled a hook to be called when sending statistics to the collector. This will
+    enable custom statistics collector to be built.  Also added hooks for
+    initializing and finalizing stats counters for individual database objects.
+    This enables additional statistics to be collected about the objects.
+
+diff --git a/src/backend/postmaster/pgstat.c b/src/backend/postmaster/pgstat.c
+index a392197..021b53e 100644
+--- a/src/backend/postmaster/pgstat.c
++++ b/src/backend/postmaster/pgstat.c
+@@ -241,6 +241,14 @@ static volatile bool got_SIGHUP = false;
+  */
+ static instr_time total_func_time;
+ 
++/*
++ * Hooks to be called from the backends when reporting stats to the collector
++ * or initializing/finalzing the per-object stats counters.
++ */
++report_stat_hook_type report_stat_hook = NULL;
++start_function_stat_hook_type start_function_stat_hook = NULL;
++end_function_stat_hook_type end_function_stat_hook = NULL;
++start_table_stat_hook_type start_table_stat_hook = NULL;
+ 
+ /* ----------
+  * Local function forward declarations
+@@ -834,6 +842,10 @@ pgstat_report_stat(bool force)
+ 
+ 	/* Now, send function statistics */
+ 	pgstat_send_funcstats();
++
++	/* Call any hooks after the stats have been sent */
++	if (report_stat_hook)
++		report_stat_hook();
+ }
+ 
+ /*
+@@ -1545,6 +1557,10 @@ pgstat_init_function_usage(FunctionCallInfoData *fcinfo,
+ 
+ 	/* get clock time as of function start */
+ 	INSTR_TIME_SET_CURRENT(fcu->f_start);
++
++	/* Call hooks */
++	if (start_function_stat_hook)
++		start_function_stat_hook(fcinfo, fcu);
+ }
+ 
+ /*
+@@ -1615,6 +1631,10 @@ pgstat_end_function_usage(PgStat_FunctionCallUsage *fcu, bool finalize)
+ 
+ 	/* indicate that we have something to send */
+ 	have_function_stats = true;
++
++	/* Call any hooks */
++	if (end_function_stat_hook)
++		end_function_stat_hook(fcu, finalize);
+ }
+ 
+ 
+@@ -1664,6 +1684,10 @@ pgstat_initstats(Relation rel)
+ 
+ 	/* Else find or make the PgStat_TableStatus entry, and update link */
+ 	rel->pgstat_info = get_tabstat_entry(rel_id, rel->rd_rel->relisshared);
++
++	/* Call any hooks */
++	if (start_table_stat_hook)
++		start_table_stat_hook(rel);
+ }
+ 
+ /*
+diff --git a/src/include/pgstat.h b/src/include/pgstat.h
+index 4e8dac6..ef93ac9 100644
+--- a/src/include/pgstat.h
++++ b/src/include/pgstat.h
+@@ -987,6 +987,18 @@ typedef struct PgStat_FunctionCallUsage
+ 	instr_time	f_start;
+ } PgStat_FunctionCallUsage;
+ 
++/*
++ * Hooks for extending the stats reporting subsystem
++ */
++typedef void (*report_stat_hook_type)(void);
++typedef void (*start_function_stat_hook_type)(FunctionCallInfoData *, PgStat_FunctionCallUsage *);
++typedef void (*end_function_stat_hook_type)(PgStat_FunctionCallUsage *, bool finalize);
++typedef void (*start_table_stat_hook_type)(Relation);
++
++extern PGDLLIMPORT report_stat_hook_type report_stat_hook;
++extern PGDLLIMPORT start_function_stat_hook_type start_function_stat_hook;
++extern PGDLLIMPORT end_function_stat_hook_type end_function_stat_hook;
++extern PGDLLIMPORT start_table_stat_hook_type start_table_stat_hook;
+ 
+ /* ----------
+  * GUC parameters

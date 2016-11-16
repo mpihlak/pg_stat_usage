@@ -173,10 +173,6 @@ static void report_stat(void)
 		hash_seq_init(&hstat, relation_usage_tab);
 		while ((tui = hash_seq_search(&hstat)) != NULL)
 		{
-			/*
-			 * XXX: the stat's system has already reset the counters and we're reporting zeros here :(
-			 * Might need to move the stats hook to earlier in the function.
-			 */
 			if (tui->t_counters)
 			{
 				elog(LOG, "table access: %s.%s oid=%u function=%u scans=%lu",

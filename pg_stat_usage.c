@@ -161,13 +161,35 @@ static void report_stat(void)
 			if (memcmp(&entry->counters, &all_zero_counters, sizeof(all_zero_counters)) == 0)
 				continue;
 
-			elog(LOG, "object usage: %s.%s oid=%u parent=%u calls=%lu scans=%lu",
-					entry->schema_name,
-					entry->object_name,
-					entry->key.obj_id,
-					entry->key.calling_function_id,
-					entry->counters.function_counts.f_numcalls,
-					entry->counters.table_counts.t_numscans);
+			if (ObjIsFunction(entry))
+			{
+				elog(LOG, "function call: %c %s.%s oid=%u parent=%u calls=%lu total_time=%lu self_time=%lu",
+						entry->obj_kind,
+						entry->schema_name,
+						entry->object_name,
+						entry->key.obj_id,
+						entry->key.calling_function_id,
+						entry->counters.function_counts.f_numcalls,
+						INSTR_TIME_GET_MICROSEC(entry->counters.function_counts.f_total_time),
+						INSTR_TIME_GET_MICROSEC(entry->counters.function_counts.f_self_time));
+			}
+			else
+			{
+				elog(LOG, "object usage: %c %s.%s oid=%u scans=%lu tup_fetch=%lu tup_ret=%lu ins=%lu upd=%lu del=%lu blks_fetch=%lu blks_hit=%lu",
+						entry->obj_kind,
+						entry->schema_name,
+						entry->object_name,
+						entry->key.obj_id,
+						entry->counters.table_counts.t_numscans,
+						entry->counters.table_counts.t_tuples_returned,
+						entry->counters.table_counts.t_tuples_fetched,
+						entry->counters.table_counts.t_tuples_inserted,
+						entry->counters.table_counts.t_tuples_updated,
+						entry->counters.table_counts.t_tuples_deleted,
+						entry->counters.table_counts.t_blocks_fetched,
+						entry->counters.table_counts.t_blocks_hit
+						);
+			}
 
 		}
 	}
@@ -322,7 +344,8 @@ static void start_table_stat(Relation rel)
 
 	oldctx = MemoryContextSwitchTo(TopMemoryContext);
 
-	entry = fetch_or_create_object(rel->rd_id, current_function_oid, rel->rd_rel->relkind);
+	/* Always use InvalidOid as func context -- or figure out how to make it work */
+	entry = fetch_or_create_object(rel->rd_id, InvalidOid, rel->rd_rel->relkind);
 
 	if (IsNewEntry(entry))
 	{

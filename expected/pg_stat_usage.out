@@ -1,0 +1,58 @@
+create extension pg_stat_usage;
+begin;
+create table t (
+i serial primary key
+);
+insert into t select * from generate_series(1, 1000);
+create or replace function foo() returns void as
+$$
+begin
+	perform bar();
+end;
+$$ language plpgsql;
+create or replace function bar() returns void as
+$$
+begin
+	perform baz();
+	perform qux();
+end;
+$$ language plpgsql;
+create or replace function baz() returns void as
+$$
+begin
+	perform qux();
+	perform qux();
+end;
+$$ language plpgsql;
+create or replace function qux() returns void as
+$$
+begin
+	perform count(*) from t;
+end;
+$$ language plpgsql;
+select foo();
+ foo 
+-----
+ 
+(1 row)
+
+end;
+-- allow some time for the stats to process
+select pg_sleep(1);
+ pg_sleep 
+----------
+ 
+(1 row)
+
+select object_type, object_schema, object_name, num_calls, num_scans from pg_stat_usage
+order by 1, 2, 3;
+ object_type | object_schema | object_name | num_calls | num_scans 
+-------------+---------------+-------------+-----------+-----------
+ F           | public        | bar         |         1 |         0
+ F           | public        | baz         |         1 |         0
+ F           | public        | foo         |         1 |         0
+ F           | public        | qux         |         3 |         0
+ F           | public        | qux         |         2 |         0
+ r           | public        | t           |         0 |         4
+(6 rows)
+

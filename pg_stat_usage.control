@@ -1,0 +1,5 @@
+# pg_stat_usage extension
+comment = 'track usage statistics of stored procedure calls'
+default_version = '1.0'
+module_pathname = '$libdir/plugins/pg_stat_usage'
+relocatable = true

@@ -1,7 +1,5 @@
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
--- \echo Use "CREATE EXTENSION pg_stat_statements" to load this file. \quit
-
-DROP FUNCTION pg_stat_usage() CASCADE;
+\echo Use "CREATE EXTENSION pg_stat_usage" to load this file. \quit
 
 CREATE FUNCTION pg_stat_usage(
 	OUT object_oid oid,
@@ -15,11 +13,8 @@ CREATE FUNCTION pg_stat_usage(
 	OUT self_time int8
 )
 RETURNS SETOF record
-AS '$libdir/pg_stat_usage'
+AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
-
---AS 'MODULE_PATHNAME', 'pg_stat_usage_1_0'
---LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
 
 CREATE VIEW pg_stat_usage AS
   SELECT * FROM pg_stat_usage();

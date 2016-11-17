@@ -15,7 +15,6 @@ Requires PostgreSQL stats collector hooks patch - included in the patches direct
  * Use CPU time instead of wall clock time
  * Figure out a way to reliably associate table stats with function context
  * Track role names and IP addresses
- * Package as an extension
  * Add a collector process that aggregates the stats from different backends
 
 ## Building

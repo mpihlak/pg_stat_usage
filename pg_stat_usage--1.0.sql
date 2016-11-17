@@ -1,6 +1,8 @@
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 -- \echo Use "CREATE EXTENSION pg_stat_statements" to load this file. \quit
 
+DROP FUNCTION pg_stat_usage() CASCADE;
+
 CREATE FUNCTION pg_stat_usage(
 	OUT object_oid oid,
 	OUT parent_oid oid,

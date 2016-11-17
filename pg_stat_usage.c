@@ -13,65 +13,59 @@
 #include "utils/syscache.h"
 #include "utils/lsyscache.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_class.h"
 #include "access/htup_details.h"
 
 #include <sys/times.h>
 
 PG_MODULE_MAGIC;
 
+#define IsNewEntry(entry)	(!(entry)->object_name)
+
+#define OBJ_KIND_FUNCTION	'F'
+
+#define ObjIsFunction(obj)	((obj)->obj_kind == OBJ_KIND_FUNCTION)
+
 /* 
- * Key into parent/child function call hash table
+ * Identifies a database object with a calling stored procedure context
  */
-typedef struct FunctionUsageKey 
+typedef struct ObjectKey 
 {
-	Oid			f_kid;
-	Oid			f_parent;
-} FunctionUsageKey;
+	Oid			obj_id;
+	Oid			calling_function_id;
+} ObjectKey;
 
 /*
- * Counters for tracking function usage
+ * Counters for tracking database  usage
  */
-typedef struct FunctionUsageCounters
+typedef struct ObjectUsageCounters
 {
 	PgStat_Counter		num_calls;
+	PgStat_Counter		num_scans;
 	PgStat_Counter		total_time;
 	PgStat_Counter		self_time;
-} FunctionUsageCounters;
+} ObjectUsageCounters;
 
 /*
- * Essential information about the tracked functions.
+ * Essential information about the tracked object.
  */
-typedef struct BackendFunctionCallInfo
+typedef struct DatabaseObjectStats
 {
-	FunctionUsageKey		f_key;
-	FunctionUsageCounters	f_counters;
-	int						f_nargs;
-	char				   *f_schema;
-	char				   *f_name;
-} BackendFunctionCallInfo;
+	ObjectKey				key;			/* Hashing key. NB! keep as first field of the struct! */
+	ObjectUsageCounters		counters;
 
-/* 
- * Key into table/funccontext hash table
- */
-typedef struct TableUsageKey
-{
-	Oid						t_id;
-	Oid						t_func_context;
-} TableUsageKey;
+	char					obj_kind;		/* 'F' for functions, otherwise maps to relkind (RELKIND_RELATION, etc.) */
+	char				   *schema_name;
+	char				   *object_name;
 
-/*
- * Track table usage counters. Basically same as Relation structure has, but also
- * keep function call context (if there is any).
- */
-typedef struct TableUsageInfo
-{
-	TableUsageKey			t_key;
-	char				   *t_name;
-	char				   *t_schema;
-	char				 	t_relkind;
+	/*
+	 * For relations we need to keep a pointer to the stats counters.
+	 * As there is no end_table_stats() function we read the counter values
+	 * in report_stat() instead.
+	 */
 	PgStat_TableCounts	   *t_statptr;
-	PgStat_TableCounts	    t_counters;
-} TableUsageInfo;
+} DatabaseObjectStats;
+
 
 void _PG_init(void);
 void _PG_fini(void);
@@ -79,6 +73,7 @@ static void report_stat(void);
 static void start_function_stat(FunctionCallInfoData *fcinfo, PgStat_FunctionCallUsage *fcu);
 static void end_function_stat(PgStat_FunctionCallUsage *fcu, bool finalize);
 static void start_table_stat(Relation rel);
+DatabaseObjectStats *lookup_object(Oid obj_id, Oid parent_id);
 
 PG_FUNCTION_INFO_V1(pg_stat_usage);
 
@@ -91,14 +86,9 @@ static Oid 		current_function_oid = InvalidOid;
 static Oid 		current_function_parent = InvalidOid;
 
 /*
- * This holds the call statistics for parent/func pairs.
+ * This holds the usage statistics for obj/calling func pairs.
  */
-static HTAB    *function_usage_tab = NULL;
-
-/*
- * This is for the relation's stats
- */
-static HTAB	   *relation_usage_tab = NULL;
+static HTAB    *object_usage_tab = NULL;
 
 /*
  * We need to track the oid of current function call. Keep this in a stack until a
@@ -142,47 +132,71 @@ void _PG_fini(void)
 }
 
 /*
- * Called, when the backend wants to send its accumulated stats to the collector.
+ * Called when the backend wants to send its accumulated stats to the collector.
  *
- * NB! This is performed outside of a transaction. No syscache lookups here.
+ * We probably need to clear the stats counter here if we're sending the stats
+ * to an external collector. Make this a GUC option.
  */
 static void report_stat(void)
 {
-	BackendFunctionCallInfo	   *bfci;
-	TableUsageInfo			   *tui;
-	HASH_SEQ_STATUS				hstat;
+	DatabaseObjectStats	   *entry;
+	HASH_SEQ_STATUS			hstat;
 
-	if (function_usage_tab)
+	if (object_usage_tab)
 	{
-		hash_seq_init(&hstat, function_usage_tab);
-		while ((bfci = hash_seq_search(&hstat)) != NULL)
+		hash_seq_init(&hstat, object_usage_tab);
+		while ((entry = hash_seq_search(&hstat)) != NULL)
 		{
-			elog(LOG, "function call: %s.%s(%d) oid=%u parent=%u calls=%lu",
-					bfci->f_schema,
-					bfci->f_name,
-					bfci->f_nargs,
-					bfci->f_key.f_kid,
-					bfci->f_key.f_parent,
-					bfci->f_counters.num_calls);
-		}
-	}
-
-	if (relation_usage_tab)
-	{
-		hash_seq_init(&hstat, relation_usage_tab);
-		while ((tui = hash_seq_search(&hstat)) != NULL)
-		{
-			if (tui->t_statptr)
-			{
-				/* Make a copy of the counters so that they don't get lost during stats report */
-				tui->t_counters.t_numscans += tui->t_statptr->t_numscans;
-				elog(LOG, "table access: %s.%s oid=%u function=%u scans=%lu",
-					tui->t_schema, tui->t_name, tui->t_key.t_id, tui->t_key.t_func_context,
-					tui->t_counters.t_numscans);
-			}
+			elog(LOG, "object usage: %s.%s oid=%u parent=%u calls=%lu scans=%lu",
+					entry->schema_name,
+					entry->object_name,
+					entry->key.obj_id,
+					entry->key.calling_function_id,
+					entry->counters.num_calls,
+					entry->counters.num_scans);
 		}
 	}
 }
+
+/*
+ * Look up an object by it's oid and parent.
+ *
+ * Allocate the hash table if needed. Assume we're in TopMemoryContext
+ *
+ * Returns NULL if not found.
+ */
+DatabaseObjectStats *lookup_object(Oid obj_id, Oid parent_id)
+{
+	DatabaseObjectStats	   *entry;
+	ObjectKey				key;
+	bool					found;
+
+	if (!object_usage_tab)
+	{
+		/* First time through, allocate the hash table */
+ 		HASHCTL hash_ctl;
+ 
+ 		memset(&hash_ctl, 0, sizeof(hash_ctl));
+		hash_ctl.keysize = sizeof(key);
+ 		hash_ctl.entrysize = sizeof(DatabaseObjectStats);
+		hash_ctl.hash = tag_hash;
+ 		object_usage_tab = hash_create("Object stat entries", 512, &hash_ctl, HASH_ELEM | HASH_BLOBS);
+	}
+
+	key.obj_id = obj_id;
+	key.calling_function_id = parent_id;
+	entry = hash_search(object_usage_tab, &key, HASH_ENTER, &found);
+	Assert(entry != NULL);
+
+	if (!found)
+	{
+		entry->key = key;
+		memset(&entry->counters, 0, sizeof(entry->counters));
+	}
+
+	return entry;
+}
+
 
 /* 
  * Called when the backend starts to track the counters for a function.
@@ -192,34 +206,18 @@ static void report_stat(void)
  */
 static void start_function_stat(FunctionCallInfoData *fcinfo, PgStat_FunctionCallUsage *fcu)
 {
-	FunctionUsageKey	key;
 	Oid					func_oid = fcinfo->flinfo->fn_oid;
+	DatabaseObjectStats	*entry;
 	MemoryContext 		oldctx;
-	BackendFunctionCallInfo	*bfci;
-	bool				found;
 
 	oldctx = MemoryContextSwitchTo(TopMemoryContext);
-	key.f_kid = func_oid;
-	key.f_parent = current_function_oid;
 
-	if (!function_usage_tab)
-	{
-		/* First time through, set up the functions hash table */
- 		HASHCTL hash_ctl;
- 
- 		memset(&hash_ctl, 0, sizeof(hash_ctl));
-		hash_ctl.keysize = sizeof(key);
- 		hash_ctl.entrysize = sizeof(BackendFunctionCallInfo);
-		hash_ctl.hash = tag_hash;
- 		function_usage_tab = hash_create("Function stat entries", 512, &hash_ctl, HASH_ELEM | HASH_BLOBS);
-	}
+	entry = lookup_object(func_oid, current_function_oid);
 
-	bfci = hash_search(function_usage_tab, &key, HASH_ENTER, &found);
-
-	if (!found)
+	if (IsNewEntry(entry))
 	{
 		/* 
-		 * A new parent/kid combination. Set up BackendFunctionCallInfo for it.
+		 * A new parent/kid combination. Set up DatabaseObjectStats for it.
 		 *
 		 * Note: it may be tempting to cache these results. However this is
 		 * only useful when extreme number of unique lookups is performed. As
@@ -238,16 +236,12 @@ static void start_function_stat(FunctionCallInfoData *fcinfo, PgStat_FunctionCal
 
 		functup = (Form_pg_proc) GETSTRUCT(tp);
 
-		bfci->f_key = key;
-		bfci->f_name = pstrdup(NameStr(functup->proname));
-		bfci->f_schema = get_namespace_name(functup->pronamespace);
-		bfci->f_nargs = functup->pronargs;
-		MemSet(&bfci->f_counters, 0, sizeof(bfci->f_counters));
+		entry->object_name = pstrdup(NameStr(functup->proname));
+		entry->schema_name = get_namespace_name(functup->pronamespace);
+		entry->obj_kind = OBJ_KIND_FUNCTION;
  
 		ReleaseSysCache(tp);
 	}
-
-	bfci->f_counters.num_calls++;
 
 	call_stack = lcons_oid(current_function_parent, call_stack);
 
@@ -264,27 +258,27 @@ static void start_function_stat(FunctionCallInfoData *fcinfo, PgStat_FunctionCal
  */
 static void end_function_stat(PgStat_FunctionCallUsage *fcu, bool finalize)
 {
-	MemoryContext 			oldctx;
-	FunctionUsageKey		key;
-	BackendFunctionCallInfo	*bfci;
-	bool					found;
+	ObjectKey				key;
+	DatabaseObjectStats	   *entry;
 
-	oldctx = MemoryContextSwitchTo(TopMemoryContext);
+	/* Could happen if the library is loaded from a stored procedure. */
+	if (!object_usage_tab || !call_stack)
+		return;
 
-	key.f_kid = current_function_oid;
-	key.f_parent = current_function_parent;
+	key.obj_id = current_function_oid;
+	key.calling_function_id = current_function_parent;
 
-	bfci = hash_search(function_usage_tab, &key, HASH_FIND, &found);
-	Assert(found);
-	Assert(bfci);
+	entry = hash_search(object_usage_tab, &key, HASH_FIND, NULL);
+	Assert(entry);
+
+	if (finalize)
+		entry->counters.num_calls++;
 
 	/* We need to "pop" the current function oid and parent */
-	current_function_oid = key.f_parent;
+	current_function_oid = key.calling_function_id;
 	current_function_parent = linitial_oid(call_stack);
 
 	call_stack = list_delete_first(call_stack);
-
-	MemoryContextSwitchTo(oldctx);
 }
 
 /*
@@ -294,10 +288,8 @@ static void end_function_stat(PgStat_FunctionCallUsage *fcu, bool finalize)
  */
 static void start_table_stat(Relation rel)
 {
-	TableUsageKey		key;
+	DatabaseObjectStats	*entry;
 	MemoryContext 		oldctx;
-	TableUsageInfo	   *tui;
-	bool				found;
 
 	if (!rel->pgstat_info)
 		return;
@@ -308,24 +300,9 @@ static void start_table_stat(Relation rel)
 
 	oldctx = MemoryContextSwitchTo(TopMemoryContext);
 
-	key.t_id = rel->rd_id;
-	key.t_func_context = current_function_oid;
+	entry = lookup_object(rel->rd_id, current_function_oid);
 
-	if (!relation_usage_tab)
-	{
-		/* First time through, set up the functions hash table */
- 		HASHCTL hash_ctl;
- 
- 		memset(&hash_ctl, 0, sizeof(hash_ctl));
-		hash_ctl.keysize = sizeof(key);
- 		hash_ctl.entrysize = sizeof(TableUsageInfo);
-		hash_ctl.hash = tag_hash;
- 		relation_usage_tab = hash_create("Table stat entries", 512, &hash_ctl, HASH_ELEM | HASH_BLOBS);
-	}
-
-	tui = hash_search(relation_usage_tab, &key, HASH_ENTER, &found);
-
-	if (!found)
+	if (IsNewEntry(entry))
 	{
 		Form_pg_class 		reltup;
 		HeapTuple			tp;
@@ -339,15 +316,14 @@ static void start_table_stat(Relation rel)
 	
 		reltup = (Form_pg_class) GETSTRUCT(tp);
 	
-		tui->t_name = pstrdup(NameStr(reltup->relname));
-		tui->t_schema = get_namespace_name(reltup->relnamespace);
-		tui->t_relkind = reltup->relkind;
+		entry->object_name = pstrdup(NameStr(reltup->relname));
+		entry->schema_name = get_namespace_name(reltup->relnamespace);
+		entry->obj_kind = reltup->relkind;
 
-		MemSet(&tui->t_counters, 0, sizeof(tui->t_counters));
 		ReleaseSysCache(tp);
 	} 
 
-	tui->t_statptr = &rel->pgstat_info->t_counts;
+	entry->t_statptr = &rel->pgstat_info->t_counts;
 
 	MemoryContextSwitchTo(oldctx);
 }
@@ -388,69 +364,44 @@ pg_stat_usage(PG_FUNCTION_ARGS)
 
 	MemoryContextSwitchTo(oldcontext);
 
-	if (function_usage_tab)
-	{
-		HASH_SEQ_STATUS 			hstat;
-		BackendFunctionCallInfo	   *entry;
-
-		hash_seq_init(&hstat, function_usage_tab);
-		while ((entry = hash_seq_search(&hstat)) != NULL)
-		{
-			Datum		values[6];
-			bool		nulls[6];
-			int			i = 0;
-
-			if (!entry->f_counters.num_calls)
-				continue;
-
-			memset(values, 0, sizeof(values));
-			memset(nulls, 0, sizeof(nulls));
-
-			values[i++] = ObjectIdGetDatum(entry->f_key.f_kid);
-			values[i++] = ObjectIdGetDatum(entry->f_key.f_parent);
-			values[i++] = CStringGetTextDatum("F");
-			values[i++] = CStringGetTextDatum(entry->f_schema);
-			values[i++] = CStringGetTextDatum(entry->f_name);
-			values[i++] = Int64GetDatumFast(entry->f_counters.num_calls);
-
-			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
-		}
-	}
-
-	if (relation_usage_tab)
+	if (object_usage_tab)
 	{
 		HASH_SEQ_STATUS			hstat;
-		TableUsageInfo		   *entry;
+		DatabaseObjectStats	   *entry;
+		ObjectUsageCounters		all_zeroes;
 
-		hash_seq_init(&hstat, relation_usage_tab);
+		memset(&all_zeroes, 0, sizeof(all_zeroes));
+
+		hash_seq_init(&hstat, object_usage_tab);
 		while ((entry = hash_seq_search(&hstat)) != NULL)
 		{
 			Datum		values[6];
 			bool		nulls[6];
-			int			i = 0;
 			char		buf[2];
+			int			i = 0;
 
-			if (!entry->t_counters.t_numscans)
+			/* Skip objects with no stats */
+			if (memcmp(&entry->counters, &all_zeroes, sizeof(all_zeroes)) == 0)
 				continue;
 
 			memset(values, 0, sizeof(values));
 			memset(nulls, 0, sizeof(nulls));
-
-			buf[0] = entry->t_relkind;
+			buf[0] = entry->obj_kind;
 			buf[1] = '\0';
 
-			values[i++] = ObjectIdGetDatum(entry->t_key.t_id);
-			values[i++] = ObjectIdGetDatum(entry->t_key.t_func_context);
+			values[i++] = ObjectIdGetDatum(entry->key.obj_id);
+			values[i++] = ObjectIdGetDatum(entry->key.calling_function_id);
 			values[i++] = CStringGetTextDatum(buf);
-			values[i++] = CStringGetTextDatum(entry->t_schema);
-			values[i++] = CStringGetTextDatum(entry->t_name);
-			values[i++] = Int64GetDatumFast(entry->t_counters.t_numscans);
+			values[i++] = CStringGetTextDatum(entry->schema_name);
+			values[i++] = CStringGetTextDatum(entry->object_name);
+			values[i++] = Int64GetDatumFast(entry->counters.num_calls);
 
 			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 		}
 	}
 
 	tuplestore_donestoring(tupstore);
+
 	return (Datum) 0;
 }
 

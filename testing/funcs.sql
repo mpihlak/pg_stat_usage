@@ -31,3 +31,10 @@ begin
 	perform count(*) from t_test;
 end;
 $$ language plpgsql;
+
+create or replace function qux2() returns void as
+$$
+begin
+	perform count(*) from t_test;
+end;
+$$ language plpgsql;

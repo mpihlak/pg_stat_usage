@@ -12,15 +12,19 @@ Requires PostgreSQL stats collector hooks patch - included in the patches direct
  * Track role names and IP addresses
 
 ## Building
-========
-USE\_PGXS=1 make install
+Set up PostgreSQL module development environment and run
+```
+make install
+```
 
 ## Usage
-Modify postgresql.conf to include:
+In an interactive session
+```
+LOAD pg_stat_usage
+```
+
+Alternatively modify postgresql.conf to include:
 
 ```
-shared_preload_libraries = 'pg_stat_usage'
-pg_stat_usage.log_function_calls = true
-pg_stat_usage.log_call_graph = true
-pg_stat_usage.log_table_usage = true
+local_preload_libraries = 'pg_stat_usage'
 ```

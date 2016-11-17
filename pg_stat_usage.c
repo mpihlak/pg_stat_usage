@@ -12,6 +12,7 @@
 #include "catalog/pg_proc.h"
 #include "access/htup_details.h"
 
+#include <sys/times.h>
 
 PG_MODULE_MAGIC;
 
@@ -187,7 +188,8 @@ static void report_stat(void)
 /* 
  * Called when the backend starts to track the counters for a function.
  *
- * Note that this will only fire when track_function calls is set to an appropriate level.
+ * Note that this will only fire when track_function calls is set to an
+ * appropriate level.
  */
 static void start_function_stat(FunctionCallInfoData *fcinfo, PgStat_FunctionCallUsage *fcu)
 {
@@ -219,7 +221,12 @@ static void start_function_stat(FunctionCallInfoData *fcinfo, PgStat_FunctionCal
 	{
 		/* 
 		 * Ah, a new parent/kid combination. Set up BackendFunctionCallInfo for it.
-		 * TODO: Measure if it makes sense to cache the name lookups in a HTAB
+		 *
+		 * Note: it may be tempting to cache these results. However this is only
+		 * useful when extreme number of lookups is performed. As per microbenchmark
+		 * SearchSysCache + namespace lookup takes just about 160 clock ticks
+		 * to perform 10 000 000 lookups. In comparison HTAB lookup takes 22 ticks
+		 * for the same.
 		 */
 		Form_pg_proc functup;
 		HeapTuple   tp;
@@ -286,12 +293,6 @@ static void end_function_stat(PgStat_FunctionCallUsage *fcu, bool finalize)
 	current_function_oid = key.f_parent;
 	current_function_parent = linitial_oid(call_stack);
 
-#if 0
-	elog(INFO, "END: function %s.%s(%d) oid=%u parent=%u grandparent=%u", 
-		bfci->f_schema, bfci->f_name, bfci->f_nargs,
-		key.f_kid, key.f_parent, current_function_parent);
-#endif
-
 	current_depth--;
 
 	call_stack = list_delete_first(call_stack);
@@ -309,8 +310,6 @@ static void start_table_stat(Relation rel)
 	TableUsageKey		key;
 	MemoryContext 		oldctx;
 	TableUsageInfo	   *tui;
-	Form_pg_class 		reltup;
-	HeapTuple			tp;
 	bool				found;
 
 	if (!rel->pgstat_info)
@@ -341,6 +340,9 @@ static void start_table_stat(Relation rel)
 
 	if (!found)
 	{
+		Form_pg_class 		reltup;
+		HeapTuple			tp;
+
 		tp = SearchSysCache(RELOID, ObjectIdGetDatum(rel->rd_id), 0, 0, 0);
 	
 		if (!HeapTupleIsValid(tp))

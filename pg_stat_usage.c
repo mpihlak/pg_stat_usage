@@ -38,12 +38,10 @@ typedef struct ObjectKey
 /*
  * Counters for tracking database  usage
  */
-typedef struct ObjectUsageCounters
+typedef union ObjectUsageCounters
 {
-	PgStat_Counter		num_calls;
-	PgStat_Counter		num_scans;
-	PgStat_Counter		total_time;
-	PgStat_Counter		self_time;
+	PgStat_FunctionCounts	function_counts;
+	PgStat_TableCounts		table_counts;
 } ObjectUsageCounters;
 
 /*
@@ -51,7 +49,7 @@ typedef struct ObjectUsageCounters
  */
 typedef struct DatabaseObjectStats
 {
-	ObjectKey				key;			/* Hashing key. NB! keep as first field of the struct! */
+	ObjectKey				key;			/* Hashing key. Keep as first field of the struct! */
 	ObjectUsageCounters		counters;
 
 	char					obj_kind;		/* 'F' for functions, otherwise maps to relkind (RELKIND_RELATION, etc.) */
@@ -73,9 +71,10 @@ static void report_stat(void);
 static void start_function_stat(FunctionCallInfoData *fcinfo, PgStat_FunctionCallUsage *fcu);
 static void end_function_stat(PgStat_FunctionCallUsage *fcu, bool finalize);
 static void start_table_stat(Relation rel);
-DatabaseObjectStats *lookup_object(Oid obj_id, Oid parent_id);
+DatabaseObjectStats *fetch_or_create_object(Oid obj_id, Oid parent_id, char obj_kind);
 
 PG_FUNCTION_INFO_V1(pg_stat_usage);
+
 
 static report_stat_hook_type			prev_report_stat_hook = NULL;
 static start_function_stat_hook_type	prev_start_function_stat_hook = NULL;
@@ -84,6 +83,8 @@ static start_table_stat_hook_type		prev_start_table_stat_hook = NULL;
 
 static Oid 		current_function_oid = InvalidOid;
 static Oid 		current_function_parent = InvalidOid;
+
+static const ObjectUsageCounters		all_zero_counters;
 
 /*
  * This holds the usage statistics for obj/calling func pairs.
@@ -147,13 +148,27 @@ static void report_stat(void)
 		hash_seq_init(&hstat, object_usage_tab);
 		while ((entry = hash_seq_search(&hstat)) != NULL)
 		{
+			/* 
+			 * For relations, copy the counters out from the PgStat structures
+			 * so that they don't get cleared by the stats collector.
+			 */
+			if (!ObjIsFunction(entry) && entry->t_statptr)
+			{
+				entry->counters.table_counts.t_numscans += entry->t_statptr->t_numscans;
+			}
+
+			/* Skip objects with no stats */
+			if (memcmp(&entry->counters, &all_zero_counters, sizeof(all_zero_counters)) == 0)
+				continue;
+
 			elog(LOG, "object usage: %s.%s oid=%u parent=%u calls=%lu scans=%lu",
 					entry->schema_name,
 					entry->object_name,
 					entry->key.obj_id,
 					entry->key.calling_function_id,
-					entry->counters.num_calls,
-					entry->counters.num_scans);
+					entry->counters.function_counts.f_numcalls,
+					entry->counters.table_counts.t_numscans);
+
 		}
 	}
 }
@@ -165,7 +180,7 @@ static void report_stat(void)
  *
  * Returns NULL if not found.
  */
-DatabaseObjectStats *lookup_object(Oid obj_id, Oid parent_id)
+DatabaseObjectStats *fetch_or_create_object(Oid obj_id, Oid parent_id, char obj_kind)
 {
 	DatabaseObjectStats	   *entry;
 	ObjectKey				key;
@@ -191,6 +206,9 @@ DatabaseObjectStats *lookup_object(Oid obj_id, Oid parent_id)
 	if (!found)
 	{
 		entry->key = key;
+		entry->obj_kind = obj_kind;
+		entry->object_name = NULL;
+		entry->schema_name = NULL;
 		memset(&entry->counters, 0, sizeof(entry->counters));
 	}
 
@@ -212,7 +230,7 @@ static void start_function_stat(FunctionCallInfoData *fcinfo, PgStat_FunctionCal
 
 	oldctx = MemoryContextSwitchTo(TopMemoryContext);
 
-	entry = lookup_object(func_oid, current_function_oid);
+	entry = fetch_or_create_object(func_oid, current_function_oid, OBJ_KIND_FUNCTION);
 
 	if (IsNewEntry(entry))
 	{
@@ -225,20 +243,16 @@ static void start_function_stat(FunctionCallInfoData *fcinfo, PgStat_FunctionCal
 		 * about 160 clock ticks to perform 10 000 000 lookups. In comparison
 		 * HTAB lookup takes 22 ticks for the same.
 		 */
-		Form_pg_proc functup;
-		HeapTuple   tp;
+		Form_pg_proc	functup;
+		HeapTuple		tp;
 
 		tp = SearchSysCache(PROCOID, ObjectIdGetDatum(func_oid), 0, 0, 0);
 		if (!HeapTupleIsValid(tp))
-			ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				errmsg("function \"%u\" does not exist", func_oid)));
-
+			elog(ERROR, "cache lookup failed for function %u", func_oid);
 		functup = (Form_pg_proc) GETSTRUCT(tp);
 
 		entry->object_name = pstrdup(NameStr(functup->proname));
 		entry->schema_name = get_namespace_name(functup->pronamespace);
-		entry->obj_kind = OBJ_KIND_FUNCTION;
  
 		ReleaseSysCache(tp);
 	}
@@ -272,7 +286,7 @@ static void end_function_stat(PgStat_FunctionCallUsage *fcu, bool finalize)
 	Assert(entry);
 
 	if (finalize)
-		entry->counters.num_calls++;
+		entry->counters.function_counts = *fcu->fs;
 
 	/* We need to "pop" the current function oid and parent */
 	current_function_oid = key.calling_function_id;
@@ -285,6 +299,14 @@ static void end_function_stat(PgStat_FunctionCallUsage *fcu, bool finalize)
  * Called when the backend wants to add some stats to a relation.
  *
  * We only try to look at non-system objects.
+ *
+ * XXX: There's a brainfart here. In reality we cannot reliably
+ * track surrounding function context for tables. The start_table_stat()
+ * is called just once for each table during transaction.
+ *
+ * Potentially there's a way to deduce the per-function counters by
+ * scanning through the table stats at each function call end. That's
+ * expensive though.
  */
 static void start_table_stat(Relation rel)
 {
@@ -300,27 +322,12 @@ static void start_table_stat(Relation rel)
 
 	oldctx = MemoryContextSwitchTo(TopMemoryContext);
 
-	entry = lookup_object(rel->rd_id, current_function_oid);
+	entry = fetch_or_create_object(rel->rd_id, current_function_oid, rel->rd_rel->relkind);
 
 	if (IsNewEntry(entry))
 	{
-		Form_pg_class 		reltup;
-		HeapTuple			tp;
-
-		tp = SearchSysCache(RELOID, ObjectIdGetDatum(rel->rd_id), 0, 0, 0);
-	
-		if (!HeapTupleIsValid(tp))
-			ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				errmsg("relation \"%u\" does not exist", rel->rd_id)));
-	
-		reltup = (Form_pg_class) GETSTRUCT(tp);
-	
-		entry->object_name = pstrdup(NameStr(reltup->relname));
-		entry->schema_name = get_namespace_name(reltup->relnamespace);
-		entry->obj_kind = reltup->relkind;
-
-		ReleaseSysCache(tp);
+		entry->object_name = pstrdup(NameStr(rel->rd_rel->relname));
+		entry->schema_name = get_namespace_name(rel->rd_rel->relnamespace);
 	} 
 
 	entry->t_statptr = &rel->pgstat_info->t_counts;
@@ -368,20 +375,17 @@ pg_stat_usage(PG_FUNCTION_ARGS)
 	{
 		HASH_SEQ_STATUS			hstat;
 		DatabaseObjectStats	   *entry;
-		ObjectUsageCounters		all_zeroes;
-
-		memset(&all_zeroes, 0, sizeof(all_zeroes));
 
 		hash_seq_init(&hstat, object_usage_tab);
 		while ((entry = hash_seq_search(&hstat)) != NULL)
 		{
-			Datum		values[6];
-			bool		nulls[6];
+			Datum		values[9];
+			bool		nulls[9];
 			char		buf[2];
 			int			i = 0;
 
 			/* Skip objects with no stats */
-			if (memcmp(&entry->counters, &all_zeroes, sizeof(all_zeroes)) == 0)
+			if (memcmp(&entry->counters, &all_zero_counters, sizeof(all_zero_counters)) == 0)
 				continue;
 
 			memset(values, 0, sizeof(values));
@@ -394,7 +398,21 @@ pg_stat_usage(PG_FUNCTION_ARGS)
 			values[i++] = CStringGetTextDatum(buf);
 			values[i++] = CStringGetTextDatum(entry->schema_name);
 			values[i++] = CStringGetTextDatum(entry->object_name);
-			values[i++] = Int64GetDatumFast(entry->counters.num_calls);
+
+			if (ObjIsFunction(entry))
+			{
+				values[i++] = Int64GetDatumFast(entry->counters.function_counts.f_numcalls);
+				values[i++] = Int64GetDatumFast(0);
+				values[i++] = Int64GetDatumFast(INSTR_TIME_GET_MICROSEC(entry->counters.function_counts.f_total_time));
+				values[i++] = Int64GetDatumFast(INSTR_TIME_GET_MICROSEC(entry->counters.function_counts.f_self_time));
+			}
+			else
+			{
+				values[i++] = Int64GetDatumFast(0);
+				values[i++] = Int64GetDatumFast(entry->counters.table_counts.t_numscans);
+				values[i++] = Int64GetDatumFast(0);
+				values[i++] = Int64GetDatumFast(0);
+			}
 
 			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 		}

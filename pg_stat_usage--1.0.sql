@@ -9,7 +9,10 @@ CREATE FUNCTION pg_stat_usage(
 	OUT object_type text,
     OUT object_schema text,
     OUT object_name text,
-	OUT num_calls int8
+	OUT num_calls int8,
+	OUT num_scans int8,
+	OUT total_time int8,
+	OUT self_time int8
 )
 RETURNS SETOF record
 AS '$libdir/pg_stat_usage'

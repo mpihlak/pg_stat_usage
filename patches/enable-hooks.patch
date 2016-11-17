@@ -1,16 +1,5 @@
-commit 450c7e4371dc71e2ac2dd05cfc0060246af9a724
-Author: Martin Pihlak <martin.pihlak@gmail.com>
-Date:   Wed Nov 16 11:32:22 2016 +0200
-
-    Hooks enabling extending the stats collector.
-    
-    Enabled a hook to be called when sending statistics to the collector. This will
-    enable custom statistics collector to be built.  Also added hooks for
-    initializing and finalizing stats counters for individual database objects.
-    This enables additional statistics to be collected about the objects.
-
 diff --git a/src/backend/postmaster/pgstat.c b/src/backend/postmaster/pgstat.c
-index a392197..021b53e 100644
+index a392197..9f86b3f 100644
 --- a/src/backend/postmaster/pgstat.c
 +++ b/src/backend/postmaster/pgstat.c
 @@ -241,6 +241,14 @@ static volatile bool got_SIGHUP = false;
@@ -28,17 +17,17 @@ index a392197..021b53e 100644
  
  /* ----------
   * Local function forward declarations
-@@ -834,6 +842,10 @@ pgstat_report_stat(bool force)
+@@ -772,6 +780,10 @@ pgstat_report_stat(bool force)
+ 		return;
+ 	last_report = now;
  
- 	/* Now, send function statistics */
- 	pgstat_send_funcstats();
-+
-+	/* Call any hooks after the stats have been sent */
++	/* Call any hooks before the stats have been cleared */
 +	if (report_stat_hook)
 +		report_stat_hook();
- }
- 
- /*
++
+ 	/*
+ 	 * Scan through the TabStatusArray struct(s) to find tables that actually
+ 	 * have counts, and build messages to send.  We have to separate shared
 @@ -1545,6 +1557,10 @@ pgstat_init_function_usage(FunctionCallInfoData *fcinfo,
  
  	/* get clock time as of function start */

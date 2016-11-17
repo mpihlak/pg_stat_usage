@@ -337,6 +337,14 @@ static void start_table_stat(Relation rel)
 
 /*
  * Fetch usage stats
+ *
+ * XXX: There is an indirect dependency on report_stat() here. It is only
+ * during report_stat() that table counters get copied from the Relation
+ * structures to our stat counters. If pg_stat_usage is called before that
+ * happens, we'll not be seeing any table stats.
+ *
+ * Not dealing with the above, as this will be likely moved to a dedicated
+ * collector process.
  */
 Datum
 pg_stat_usage(PG_FUNCTION_ARGS)

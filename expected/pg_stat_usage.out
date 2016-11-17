@@ -45,14 +45,14 @@ select pg_sleep(1);
 (1 row)
 
 select object_type, object_schema, object_name, num_calls, num_scans from pg_stat_usage
-order by 1, 2, 3;
+order by 1, 2, 3, 4, 5;
  object_type | object_schema | object_name | num_calls | num_scans 
 -------------+---------------+-------------+-----------+-----------
  F           | public        | bar         |         1 |         0
  F           | public        | baz         |         1 |         0
  F           | public        | foo         |         1 |         0
- F           | public        | qux         |         3 |         0
  F           | public        | qux         |         2 |         0
+ F           | public        | qux         |         3 |         0
  r           | public        | t           |         0 |         4
 (6 rows)
 

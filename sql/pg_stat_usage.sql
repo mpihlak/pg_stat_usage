@@ -46,5 +46,5 @@ end;
 select pg_sleep(1);
 
 select object_type, object_schema, object_name, num_calls, num_scans from pg_stat_usage
-order by 1, 2, 3;
+order by 1, 2, 3, 4, 5;
 

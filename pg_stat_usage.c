@@ -51,6 +51,8 @@ typedef struct DatabaseObjectStats
 {
 	ObjectKey				key;			/* Hashing key. Keep as first field of the struct! */
 	ObjectUsageCounters		counters;
+	ObjectUsageCounters		save_counters;	/* Aux counters for helping to deal with per-function accounting */
+	bool					have_saved_counters;
 
 	char					obj_kind;		/* 'F' for functions, otherwise maps to relkind (RELKIND_RELATION, etc.) */
 	char				   *schema_name;
@@ -138,51 +140,54 @@ static void report_stat(void)
 	DatabaseObjectStats	   *entry;
 	HASH_SEQ_STATUS			hstat;
 
-	if (object_usage_tab)
+	if (!object_usage_tab)
+		return;
+
+	hash_seq_init(&hstat, object_usage_tab);
+	while ((entry = hash_seq_search(&hstat)) != NULL)
 	{
-		hash_seq_init(&hstat, object_usage_tab);
-		while ((entry = hash_seq_search(&hstat)) != NULL)
+		/* Skip objects with no stats */
+		if (memcmp(&entry->counters, &all_zero_counters, sizeof(all_zero_counters)) == 0)
+			continue;
+
+		if (ObjIsFunction(entry))
 		{
-			/* Skip objects with no stats */
-			if (memcmp(&entry->counters, &all_zero_counters, sizeof(all_zero_counters)) == 0)
-				continue;
-
-			if (ObjIsFunction(entry))
-			{
-				elog(LOG, "pg_stat_usage: %c %s.%s oid=%u parent=%u calls=%lu total_time=%lu self_time=%lu",
-						entry->obj_kind,
-						entry->schema_name,
-						entry->object_name,
-						entry->key.obj_id,
-						entry->key.calling_function_id,
-						entry->counters.function_counts.f_numcalls,
-						INSTR_TIME_GET_MICROSEC(entry->counters.function_counts.f_total_time),
-						INSTR_TIME_GET_MICROSEC(entry->counters.function_counts.f_self_time));
-			}
-			else
-			{
-				elog(LOG, "pg_stat_usage: %c %s.%s oid=%u parent=%u scans=%lu tup_fetch=%lu tup_ret=%lu ins=%lu upd=%lu del=%lu blks_fetch=%lu blks_hit=%lu",
-						entry->obj_kind,
-						entry->schema_name,
-						entry->object_name,
-						entry->key.obj_id,
-						entry->key.calling_function_id,
-						entry->counters.table_counts.t_numscans,
-						entry->counters.table_counts.t_tuples_returned,
-						entry->counters.table_counts.t_tuples_fetched,
-						entry->counters.table_counts.t_tuples_inserted,
-						entry->counters.table_counts.t_tuples_updated,
-						entry->counters.table_counts.t_tuples_deleted,
-						entry->counters.table_counts.t_blocks_fetched,
-						entry->counters.table_counts.t_blocks_hit);
-			}
-
-			/*
-			 * XXX: We need to clear the stats counter here if we're sending the stats
-			 * to an external collector. This of course breaks the pg_stat_usage VIEW.
-			 */
-			entry->counters = all_zero_counters;
+			elog(LOG, "pg_stat_usage: %c %s.%s oid=%u parent=%u calls=%lu total_time=%lu self_time=%lu",
+					entry->obj_kind,
+					entry->schema_name,
+					entry->object_name,
+					entry->key.obj_id,
+					entry->key.calling_function_id,
+					entry->counters.function_counts.f_numcalls,
+					INSTR_TIME_GET_MICROSEC(entry->counters.function_counts.f_total_time),
+					INSTR_TIME_GET_MICROSEC(entry->counters.function_counts.f_self_time));
 		}
+		else
+		{
+			elog(LOG, "pg_stat_usage: %c %s.%s oid=%u parent=%u scans=%lu tup_fetch=%lu tup_ret=%lu ins=%lu upd=%lu del=%lu blks_fetch=%lu blks_hit=%lu",
+					entry->obj_kind,
+					entry->schema_name,
+					entry->object_name,
+					entry->key.obj_id,
+					entry->key.calling_function_id,
+					entry->counters.table_counts.t_numscans,
+					entry->counters.table_counts.t_tuples_returned,
+					entry->counters.table_counts.t_tuples_fetched,
+					entry->counters.table_counts.t_tuples_inserted,
+					entry->counters.table_counts.t_tuples_updated,
+					entry->counters.table_counts.t_tuples_deleted,
+					entry->counters.table_counts.t_blocks_fetched,
+					entry->counters.table_counts.t_blocks_hit);
+		}
+
+		/*
+		 * We need to clear the stats counter here if we're sending the stats
+		 * to an external collector. This of course breaks the pg_stat_usage VIEW 
+		 * in the backend, so that needs to be moved to the collector as well.
+		 */
+		entry->counters = all_zero_counters;
+		entry->save_counters = all_zero_counters;
+		entry->have_saved_counters = false;
 	}
 }
 
@@ -220,7 +225,9 @@ DatabaseObjectStats *fetch_or_create_object(Oid obj_id, Oid parent_id, char obj_
 		entry->obj_kind = obj_kind;
 		entry->object_name = NULL;
 		entry->schema_name = NULL;
+		entry->have_saved_counters = false;
 		memset(&entry->counters, 0, sizeof(entry->counters));
+		memset(&entry->save_counters, 0, sizeof(entry->save_counters));
 	}
 
 	return entry;
@@ -296,7 +303,13 @@ static void end_function_stat(PgStat_FunctionCallUsage *fcu, bool finalize)
 	Assert(entry);
 
 	if (finalize)
+	{
+		/*
+		 * Note that function counters should be already adjusted
+		 * to deal with nested calls. No need to adjust here.
+		 */
 		entry->counters.function_counts = *fcu->fs;
+	}
 
 	/* We need to "pop" the current function oid and parent */
 	current_function_oid = key.calling_function_id;
@@ -328,6 +341,35 @@ static void start_table_stat(Relation rel)
 		entry->schema_name = get_namespace_name(rel->rd_rel->relnamespace);
 	} 
 
+	/*
+	 * Save the counters that we had at the beginning of stats init for this
+	 * table/function pair. These will be used to adjust the stats on finalization.
+	 *
+	 * We need to do this only the first time the table is accessed
+	 * by a new stored procedure (per transaction).
+	 *
+	 * XXX: having a simple flag in the entry is not enough. We need to check for
+	 * the context of function calls. With just a flag we end like this:
+	 *
+	 * function | ins | saved
+	 * ---------+-----+----------------
+	 * f1       | 1	  | 0
+	 * f2		| 2	  | 1
+	 * f1		| 1	  | 3 (should be 0)
+	 */
+	if (!entry->have_saved_counters)
+	{
+		entry->save_counters.table_counts = rel->pgstat_info->t_counts;
+		entry->have_saved_counters = true;
+
+		if (rel->pgstat_info->trans)
+		{
+			entry->save_counters.table_counts.t_tuples_inserted = rel->pgstat_info->trans->tuples_inserted;
+			entry->save_counters.table_counts.t_tuples_updated = rel->pgstat_info->trans->tuples_updated;
+			entry->save_counters.table_counts.t_tuples_deleted = rel->pgstat_info->trans->tuples_deleted;
+		}
+	}
+
 	MemoryContextSwitchTo(oldctx);
 }
 
@@ -338,6 +380,8 @@ static void end_table_stat(Relation rel)
 {
 	ObjectKey				key;
 	DatabaseObjectStats	   *entry;
+	PgStat_TableCounts	   *curr;
+	PgStat_TableCounts	   *save;
 
 	if (!rel->pgstat_info || rel->rd_id < FirstNormalObjectId || !object_usage_tab)
 		return;
@@ -348,24 +392,38 @@ static void end_table_stat(Relation rel)
 
 	if (!entry)
 	{
-		elog(WARNING, "end_table_stat: object stats not found: %s oid=%u parent=%u", NameStr(rel->rd_rel->relname), key.obj_id, key.calling_function_id);
+		elog(WARNING, "end_table_stat: object stats not found: %s oid=%u parent=%u",
+			NameStr(rel->rd_rel->relname), key.obj_id, key.calling_function_id);
 		return;
 	}
 
-	entry->counters.table_counts = rel->pgstat_info->t_counts;
-
 	/*
-	 * Add the per-transaction counters. 
-	 * XXX: Don't care about commit/rollback status for now.
+	 * Adjust the stats to compensate for nested function calls.
+	 * Also ins/upd/del information needs to be obtined from the "trans" structure.
+	 * XXX: Even though those would be adjusted by rollback we don't care.
 	 */
+	entry->counters.table_counts = rel->pgstat_info->t_counts;
+	curr = &entry->counters.table_counts;
+	save = &entry->save_counters.table_counts;
+
+	curr->t_numscans -= save->t_numscans;
+	curr->t_tuples_returned -= save->t_tuples_returned;
+	curr->t_tuples_fetched -= save->t_tuples_fetched;
+	curr->t_blocks_fetched -= save->t_blocks_fetched;
+	curr->t_blocks_hit -= save->t_blocks_hit;
+
 	if (rel->pgstat_info->trans)
 	{
-		entry->counters.table_counts.t_tuples_inserted += rel->pgstat_info->trans->tuples_inserted;
-		entry->counters.table_counts.t_tuples_deleted += rel->pgstat_info->trans->tuples_deleted;
-		entry->counters.table_counts.t_tuples_updated += rel->pgstat_info->trans->tuples_updated;
+		curr->t_tuples_inserted = rel->pgstat_info->trans->tuples_inserted - save->t_tuples_inserted;
+		curr->t_tuples_updated = rel->pgstat_info->trans->tuples_updated - save->t_tuples_updated;
+		curr->t_tuples_deleted = rel->pgstat_info->trans->tuples_deleted - save->t_tuples_deleted;
 	}
-	
-	/* TODO: now we also need to properly account for stats within functions */
+	else
+	{
+		curr->t_tuples_inserted = save->t_tuples_inserted - save->t_tuples_inserted;
+		curr->t_tuples_updated = save->t_tuples_updated - save->t_tuples_updated;
+		curr->t_tuples_deleted = save->t_tuples_deleted - save->t_tuples_deleted;
+	}
 }
 
 /*

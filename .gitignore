@@ -31,7 +31,7 @@ lib*dll.def
 lib*.pc
 
 *.sw[po]
-patches/91-stats-logging.patch
+testing/*
 
 # Local excludes in root directory
 /GNUmakefile
@@ -43,3 +43,4 @@ patches/91-stats-logging.patch
 /Debug/
 /Release/
 /tmp_install/
+

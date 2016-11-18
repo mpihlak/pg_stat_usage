@@ -155,6 +155,13 @@ static void report_stat(void)
 			if (!ObjIsFunction(entry) && entry->t_statptr)
 			{
 				entry->counters.table_counts.t_numscans += entry->t_statptr->t_numscans;
+				entry->counters.table_counts.t_tuples_returned += entry->t_statptr->t_tuples_returned;
+				entry->counters.table_counts.t_tuples_fetched += entry->t_statptr->t_tuples_fetched;
+				entry->counters.table_counts.t_tuples_inserted += entry->t_statptr->t_tuples_inserted;
+				entry->counters.table_counts.t_tuples_updated += entry->t_statptr->t_tuples_updated;
+				entry->counters.table_counts.t_tuples_deleted += entry->t_statptr->t_tuples_deleted;
+				entry->counters.table_counts.t_blocks_fetched += entry->t_statptr->t_blocks_fetched;
+				entry->counters.table_counts.t_blocks_hit += entry->t_statptr->t_blocks_hit;
 			}
 
 			/* Skip objects with no stats */
@@ -187,8 +194,7 @@ static void report_stat(void)
 						entry->counters.table_counts.t_tuples_updated,
 						entry->counters.table_counts.t_tuples_deleted,
 						entry->counters.table_counts.t_blocks_fetched,
-						entry->counters.table_counts.t_blocks_hit
-						);
+						entry->counters.table_counts.t_blocks_hit);
 			}
 
 		}
@@ -199,8 +205,6 @@ static void report_stat(void)
  * Look up an object by it's oid and parent.
  *
  * Allocate the hash table if needed. Assume we're in TopMemoryContext
- *
- * Returns NULL if not found.
  */
 DatabaseObjectStats *fetch_or_create_object(Oid obj_id, Oid parent_id, char obj_kind)
 {
@@ -237,7 +241,6 @@ DatabaseObjectStats *fetch_or_create_object(Oid obj_id, Oid parent_id, char obj_
 	return entry;
 }
 
-
 /* 
  * Called when the backend starts to track the counters for a function.
  *
@@ -257,7 +260,7 @@ static void start_function_stat(FunctionCallInfoData *fcinfo, PgStat_FunctionCal
 	if (IsNewEntry(entry))
 	{
 		/* 
-		 * A new parent/kid combination. Set up DatabaseObjectStats for it.
+		 * A new parent/child combination. Set up DatabaseObjectStats for it.
 		 *
 		 * Note: it may be tempting to cache these results. However this is
 		 * only useful when extreme number of unique lookups is performed. As
@@ -290,7 +293,7 @@ static void start_function_stat(FunctionCallInfoData *fcinfo, PgStat_FunctionCal
 /*
  * Note: we assume here that end_function_stat has always been preceded by
  * start_function_stat for the same function. It needs to be verified that this
- * is always the case.
+ * is always the case (eg. EXCEPTION, LOAD in a stored procured, etc.).
  */
 static void end_function_stat(PgStat_FunctionCallUsage *fcu, bool finalize)
 {

@@ -132,9 +132,6 @@ void _PG_fini(void)
 
 /*
  * Called when the backend wants to send its accumulated stats to the collector.
- *
- * XXX: We need to clear the stats counter here if we're sending the stats
- * to an external collector. Presently we'd be dumping cumulative stats.
  */
 static void report_stat(void)
 {
@@ -152,7 +149,7 @@ static void report_stat(void)
 
 			if (ObjIsFunction(entry))
 			{
-				elog(LOG, "function call: %c %s.%s oid=%u parent=%u calls=%lu total_time=%lu self_time=%lu",
+				elog(LOG, "pg_stat_usage: %c %s.%s oid=%u parent=%u calls=%lu total_time=%lu self_time=%lu",
 						entry->obj_kind,
 						entry->schema_name,
 						entry->object_name,
@@ -164,7 +161,7 @@ static void report_stat(void)
 			}
 			else
 			{
-				elog(LOG, "object usage: %c %s.%s oid=%u parent=%u scans=%lu tup_fetch=%lu tup_ret=%lu ins=%lu upd=%lu del=%lu blks_fetch=%lu blks_hit=%lu",
+				elog(LOG, "pg_stat_usage: %c %s.%s oid=%u parent=%u scans=%lu tup_fetch=%lu tup_ret=%lu ins=%lu upd=%lu del=%lu blks_fetch=%lu blks_hit=%lu",
 						entry->obj_kind,
 						entry->schema_name,
 						entry->object_name,
@@ -179,6 +176,12 @@ static void report_stat(void)
 						entry->counters.table_counts.t_blocks_fetched,
 						entry->counters.table_counts.t_blocks_hit);
 			}
+
+			/*
+			 * XXX: We need to clear the stats counter here if we're sending the stats
+			 * to an external collector. This of course breaks the pg_stat_usage VIEW.
+			 */
+			entry->counters = all_zero_counters;
 		}
 	}
 }
@@ -350,6 +353,19 @@ static void end_table_stat(Relation rel)
 	}
 
 	entry->counters.table_counts = rel->pgstat_info->t_counts;
+
+	/*
+	 * Add the per-transaction counters. 
+	 * XXX: Don't care about commit/rollback status for now.
+	 */
+	if (rel->pgstat_info->trans)
+	{
+		entry->counters.table_counts.t_tuples_inserted += rel->pgstat_info->trans->tuples_inserted;
+		entry->counters.table_counts.t_tuples_deleted += rel->pgstat_info->trans->tuples_deleted;
+		entry->counters.table_counts.t_tuples_updated += rel->pgstat_info->trans->tuples_updated;
+	}
+	
+	/* TODO: now we also need to properly account for stats within functions */
 }
 
 /*

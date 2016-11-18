@@ -11,8 +11,21 @@ index b019bc1..5f8d2ad 100644
  }
  
  
+diff --git a/src/backend/access/index/indexam.c b/src/backend/access/index/indexam.c
+index 54b71cb..95db134 100644
+--- a/src/backend/access/index/indexam.c
++++ b/src/backend/access/index/indexam.c
+@@ -179,6 +179,8 @@ index_close(Relation relation, LOCKMODE lockmode)
+ 
+ 	if (lockmode != NoLock)
+ 		UnlockRelationId(&relid, lockmode);
++
++	pgstat_endstats(relation);
+ }
+ 
+ /* ----------------
 diff --git a/src/backend/postmaster/pgstat.c b/src/backend/postmaster/pgstat.c
-index a392197..fc8d7f4 100644
+index a392197..f645782 100644
 --- a/src/backend/postmaster/pgstat.c
 +++ b/src/backend/postmaster/pgstat.c
 @@ -241,6 +241,15 @@ static volatile bool got_SIGHUP = false;
@@ -64,11 +77,23 @@ index a392197..fc8d7f4 100644
  }
  
  
-@@ -1664,8 +1685,31 @@ pgstat_initstats(Relation rel)
+@@ -1655,17 +1676,36 @@ pgstat_initstats(Relation rel)
+ 	}
  
- 	/* Else find or make the PgStat_TableStatus entry, and update link */
- 	rel->pgstat_info = get_tabstat_entry(rel_id, rel->rd_rel->relisshared);
-+
+ 	/*
+-	 * If we already set up this relation in the current transaction, nothing
+-	 * to do.
++	 * Find or make the PgStat_TableStatus entry and update link, if we have
++	 * not done that alreay
+ 	 */
+-	if (rel->pgstat_info != NULL &&
+-		rel->pgstat_info->t_id == rel_id)
+-		return;
++	if (!rel->pgstat_info || rel->pgstat_info->t_id != rel_id)
++		rel->pgstat_info = get_tabstat_entry(rel_id, rel->rd_rel->relisshared);
+ 
+-	/* Else find or make the PgStat_TableStatus entry, and update link */
+-	rel->pgstat_info = get_tabstat_entry(rel_id, rel->rd_rel->relisshared);
 +	/* Call any hooks */
 +	if (start_table_stat_hook)
 +		start_table_stat_hook(rel);

@@ -1,8 +1,21 @@
+diff --git a/src/backend/access/heap/heapam.c b/src/backend/access/heap/heapam.c
+index b019bc1..5f8d2ad 100644
+--- a/src/backend/access/heap/heapam.c
++++ b/src/backend/access/heap/heapam.c
+@@ -1270,6 +1270,8 @@ relation_close(Relation relation, LOCKMODE lockmode)
+ 
+ 	if (lockmode != NoLock)
+ 		UnlockRelationId(&relid, lockmode);
++
++	pgstat_endstats(relation);
+ }
+ 
+ 
 diff --git a/src/backend/postmaster/pgstat.c b/src/backend/postmaster/pgstat.c
-index a392197..9f86b3f 100644
+index a392197..fc8d7f4 100644
 --- a/src/backend/postmaster/pgstat.c
 +++ b/src/backend/postmaster/pgstat.c
-@@ -241,6 +241,14 @@ static volatile bool got_SIGHUP = false;
+@@ -241,6 +241,15 @@ static volatile bool got_SIGHUP = false;
   */
  static instr_time total_func_time;
  
@@ -14,10 +27,11 @@ index a392197..9f86b3f 100644
 +start_function_stat_hook_type start_function_stat_hook = NULL;
 +end_function_stat_hook_type end_function_stat_hook = NULL;
 +start_table_stat_hook_type start_table_stat_hook = NULL;
++end_table_stat_hook_type end_table_stat_hook = NULL;
  
  /* ----------
   * Local function forward declarations
-@@ -772,6 +780,10 @@ pgstat_report_stat(bool force)
+@@ -772,6 +781,10 @@ pgstat_report_stat(bool force)
  		return;
  	last_report = now;
  
@@ -28,7 +42,7 @@ index a392197..9f86b3f 100644
  	/*
  	 * Scan through the TabStatusArray struct(s) to find tables that actually
  	 * have counts, and build messages to send.  We have to separate shared
-@@ -1545,6 +1557,10 @@ pgstat_init_function_usage(FunctionCallInfoData *fcinfo,
+@@ -1545,6 +1558,10 @@ pgstat_init_function_usage(FunctionCallInfoData *fcinfo,
  
  	/* get clock time as of function start */
  	INSTR_TIME_SET_CURRENT(fcu->f_start);
@@ -39,7 +53,7 @@ index a392197..9f86b3f 100644
  }
  
  /*
-@@ -1615,6 +1631,10 @@ pgstat_end_function_usage(PgStat_FunctionCallUsage *fcu, bool finalize)
+@@ -1615,6 +1632,10 @@ pgstat_end_function_usage(PgStat_FunctionCallUsage *fcu, bool finalize)
  
  	/* indicate that we have something to send */
  	have_function_stats = true;
@@ -50,7 +64,7 @@ index a392197..9f86b3f 100644
  }
  
  
-@@ -1664,6 +1684,10 @@ pgstat_initstats(Relation rel)
+@@ -1664,8 +1685,31 @@ pgstat_initstats(Relation rel)
  
  	/* Else find or make the PgStat_TableStatus entry, and update link */
  	rel->pgstat_info = get_tabstat_entry(rel_id, rel->rd_rel->relisshared);
@@ -60,12 +74,33 @@ index a392197..9f86b3f 100644
 +		start_table_stat_hook(rel);
  }
  
++
++/* ----------
++ * pgstat_endstats() -
++ *
++ *	Finalize statistics collection for a relation.
++ *	Called whenever a relation is closed.
++ *
++ *  Presently this is just an placeholder for enabling hooking into. The stats
++ *  collector itself really doesn't do anything here.
++ * ----------
++ */
++void
++pgstat_endstats(Relation rel)
++{
++	if (end_table_stat_hook)
++		end_table_stat_hook(rel);
++}
++
++
  /*
+  * get_tabstat_entry - find or create a PgStat_TableStatus entry for rel
+  */
 diff --git a/src/include/pgstat.h b/src/include/pgstat.h
-index 4e8dac6..ef93ac9 100644
+index 4e8dac6..c370531 100644
 --- a/src/include/pgstat.h
 +++ b/src/include/pgstat.h
-@@ -987,6 +987,18 @@ typedef struct PgStat_FunctionCallUsage
+@@ -987,6 +987,20 @@ typedef struct PgStat_FunctionCallUsage
  	instr_time	f_start;
  } PgStat_FunctionCallUsage;
  
@@ -76,11 +111,21 @@ index 4e8dac6..ef93ac9 100644
 +typedef void (*start_function_stat_hook_type)(FunctionCallInfoData *, PgStat_FunctionCallUsage *);
 +typedef void (*end_function_stat_hook_type)(PgStat_FunctionCallUsage *, bool finalize);
 +typedef void (*start_table_stat_hook_type)(Relation);
++typedef void (*end_table_stat_hook_type)(Relation);
 +
 +extern PGDLLIMPORT report_stat_hook_type report_stat_hook;
 +extern PGDLLIMPORT start_function_stat_hook_type start_function_stat_hook;
 +extern PGDLLIMPORT end_function_stat_hook_type end_function_stat_hook;
 +extern PGDLLIMPORT start_table_stat_hook_type start_table_stat_hook;
++extern PGDLLIMPORT end_table_stat_hook_type end_table_stat_hook;
  
  /* ----------
   * GUC parameters
+@@ -1077,6 +1091,7 @@ extern PgStat_TableStatus *find_tabstat_entry(Oid rel_id);
+ extern PgStat_BackendFunctionEntry *find_funcstat_entry(Oid func_id);
+ 
+ extern void pgstat_initstats(Relation rel);
++extern void pgstat_endstats(Relation rel);
+ 
+ /* ----------
+  * pgstat_report_wait_start() -

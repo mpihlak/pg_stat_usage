@@ -55,13 +55,6 @@ typedef struct DatabaseObjectStats
 	char					obj_kind;		/* 'F' for functions, otherwise maps to relkind (RELKIND_RELATION, etc.) */
 	char				   *schema_name;
 	char				   *object_name;
-
-	/*
-	 * For relations we need to keep a pointer to the stats counters.
-	 * As there is no end_table_stats() function we read the counter values
-	 * in report_stat() instead.
-	 */
-	PgStat_TableCounts	   *t_statptr;
 } DatabaseObjectStats;
 
 
@@ -71,6 +64,7 @@ static void report_stat(void);
 static void start_function_stat(FunctionCallInfoData *fcinfo, PgStat_FunctionCallUsage *fcu);
 static void end_function_stat(PgStat_FunctionCallUsage *fcu, bool finalize);
 static void start_table_stat(Relation rel);
+static void end_table_stat(Relation rel);
 DatabaseObjectStats *fetch_or_create_object(Oid obj_id, Oid parent_id, char obj_kind);
 
 PG_FUNCTION_INFO_V1(pg_stat_usage);
@@ -80,6 +74,7 @@ static report_stat_hook_type			prev_report_stat_hook = NULL;
 static start_function_stat_hook_type	prev_start_function_stat_hook = NULL;
 static end_function_stat_hook_type		prev_end_function_stat_hook = NULL;
 static start_table_stat_hook_type		prev_start_table_stat_hook = NULL;
+static end_table_stat_hook_type			prev_end_table_stat_hook = NULL;
 
 static Oid 		current_function_oid = InvalidOid;
 static Oid 		current_function_parent = InvalidOid;
@@ -116,6 +111,9 @@ _PG_init(void)
 
 	prev_start_table_stat_hook = start_table_stat_hook;
 	start_table_stat_hook = start_table_stat;
+
+	prev_end_table_stat_hook = end_table_stat_hook;
+	end_table_stat_hook = end_table_stat;
 }
 
 /*
@@ -135,8 +133,8 @@ void _PG_fini(void)
 /*
  * Called when the backend wants to send its accumulated stats to the collector.
  *
- * We probably need to clear the stats counter here if we're sending the stats
- * to an external collector. Make this a GUC option.
+ * XXX: We need to clear the stats counter here if we're sending the stats
+ * to an external collector. Presently we'd be dumping cumulative stats.
  */
 static void report_stat(void)
 {
@@ -148,22 +146,6 @@ static void report_stat(void)
 		hash_seq_init(&hstat, object_usage_tab);
 		while ((entry = hash_seq_search(&hstat)) != NULL)
 		{
-			/* 
-			 * For relations, copy the counters out from the PgStat structures
-			 * so that they don't get cleared by the stats collector.
-			 */
-			if (!ObjIsFunction(entry) && entry->t_statptr)
-			{
-				entry->counters.table_counts.t_numscans += entry->t_statptr->t_numscans;
-				entry->counters.table_counts.t_tuples_returned += entry->t_statptr->t_tuples_returned;
-				entry->counters.table_counts.t_tuples_fetched += entry->t_statptr->t_tuples_fetched;
-				entry->counters.table_counts.t_tuples_inserted += entry->t_statptr->t_tuples_inserted;
-				entry->counters.table_counts.t_tuples_updated += entry->t_statptr->t_tuples_updated;
-				entry->counters.table_counts.t_tuples_deleted += entry->t_statptr->t_tuples_deleted;
-				entry->counters.table_counts.t_blocks_fetched += entry->t_statptr->t_blocks_fetched;
-				entry->counters.table_counts.t_blocks_hit += entry->t_statptr->t_blocks_hit;
-			}
-
 			/* Skip objects with no stats */
 			if (memcmp(&entry->counters, &all_zero_counters, sizeof(all_zero_counters)) == 0)
 				continue;
@@ -182,11 +164,12 @@ static void report_stat(void)
 			}
 			else
 			{
-				elog(LOG, "object usage: %c %s.%s oid=%u scans=%lu tup_fetch=%lu tup_ret=%lu ins=%lu upd=%lu del=%lu blks_fetch=%lu blks_hit=%lu",
+				elog(LOG, "object usage: %c %s.%s oid=%u parent=%u scans=%lu tup_fetch=%lu tup_ret=%lu ins=%lu upd=%lu del=%lu blks_fetch=%lu blks_hit=%lu",
 						entry->obj_kind,
 						entry->schema_name,
 						entry->object_name,
 						entry->key.obj_id,
+						entry->key.calling_function_id,
 						entry->counters.table_counts.t_numscans,
 						entry->counters.table_counts.t_tuples_returned,
 						entry->counters.table_counts.t_tuples_fetched,
@@ -196,7 +179,6 @@ static void report_stat(void)
 						entry->counters.table_counts.t_blocks_fetched,
 						entry->counters.table_counts.t_blocks_hit);
 			}
-
 		}
 	}
 }
@@ -322,33 +304,20 @@ static void end_function_stat(PgStat_FunctionCallUsage *fcu, bool finalize)
 
 /*
  * Called when the backend wants to add some stats to a relation.
- *
  * We only try to look at non-system objects.
- *
- * XXX: There's a brainfart here. In reality we cannot reliably
- * track surrounding function context for tables. The start_table_stat()
- * is called just once for each table during transaction.
- *
- * Potentially there's a way to deduce the per-function counters by
- * scanning through the table stats at each function call end. That's
- * expensive though.
  */
 static void start_table_stat(Relation rel)
 {
 	DatabaseObjectStats	*entry;
 	MemoryContext 		oldctx;
 
-	if (!rel->pgstat_info)
-		return;
-
-	if (rel->rd_id < FirstNormalObjectId)
-		/* Skip system objects for now */
+	if (!rel->pgstat_info || rel->rd_id < FirstNormalObjectId)
 		return;
 
 	oldctx = MemoryContextSwitchTo(TopMemoryContext);
 
 	/* Always use InvalidOid as func context -- or figure out how to make it work */
-	entry = fetch_or_create_object(rel->rd_id, InvalidOid, rel->rd_rel->relkind);
+	entry = fetch_or_create_object(rel->rd_id, current_function_oid, rel->rd_rel->relkind);
 
 	if (IsNewEntry(entry))
 	{
@@ -356,21 +325,35 @@ static void start_table_stat(Relation rel)
 		entry->schema_name = get_namespace_name(rel->rd_rel->relnamespace);
 	} 
 
-	entry->t_statptr = &rel->pgstat_info->t_counts;
-
 	MemoryContextSwitchTo(oldctx);
 }
 
 /*
- * Fetch usage stats
- *
- * XXX: There is an indirect dependency on report_stat() here. It is only
- * during report_stat() that table counters get copied from the Relation
- * structures to our stat counters. If pg_stat_usage is called before that
- * happens, we'll not be seeing any table stats.
- *
- * Not dealing with the above, as this will be likely moved to a dedicated
- * collector process.
+ * Finalize the statistics collection for a table
+ */
+static void end_table_stat(Relation rel)
+{
+	ObjectKey				key;
+	DatabaseObjectStats	   *entry;
+
+	if (!rel->pgstat_info || rel->rd_id < FirstNormalObjectId || !object_usage_tab)
+		return;
+
+	key.obj_id = rel->rd_id;
+	key.calling_function_id = current_function_oid;
+	entry = hash_search(object_usage_tab, &key, HASH_FIND, NULL);
+
+	if (!entry)
+	{
+		elog(WARNING, "end_table_stat: object stats not found: %s oid=%u parent=%u", NameStr(rel->rd_rel->relname), key.obj_id, key.calling_function_id);
+		return;
+	}
+
+	entry->counters.table_counts = rel->pgstat_info->t_counts;
+}
+
+/*
+ * A SRF for fetching usage stats
  */
 Datum
 pg_stat_usage(PG_FUNCTION_ARGS)

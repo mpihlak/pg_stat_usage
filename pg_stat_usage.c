@@ -1,3 +1,8 @@
+/*
+ * BUGS:
+ * - function call accounting is messed up if many functions are called within a tx
+ * - table accounting is broken for CURSOR loops and nested functions
+ */
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -164,7 +169,8 @@ static void report_stat(void)
 		}
 		else
 		{
-			elog(LOG, "pg_stat_usage: %c %s.%s oid=%u parent=%u scans=%lu tup_fetch=%lu tup_ret=%lu ins=%lu upd=%lu del=%lu blks_fetch=%lu blks_hit=%lu",
+			elog(LOG, "pg_stat_usage: %c %s.%s oid=%u parent=%u scans=%lu tup_fetch=%lu "
+					  "tup_ret=%lu ins=%lu upd=%lu del=%lu blks_fetch=%lu blks_hit=%lu",
 					entry->obj_kind,
 					entry->schema_name,
 					entry->object_name,
@@ -341,33 +347,14 @@ static void start_table_stat(Relation rel)
 		entry->schema_name = get_namespace_name(rel->rd_rel->relnamespace);
 	} 
 
-	/*
-	 * Save the counters that we had at the beginning of stats init for this
-	 * table/function pair. These will be used to adjust the stats on finalization.
-	 *
-	 * We need to do this only the first time the table is accessed
-	 * by a new stored procedure (per transaction).
-	 *
-	 * XXX: having a simple flag in the entry is not enough. We need to check for
-	 * the context of function calls. With just a flag we end like this:
-	 *
-	 * function | ins | saved
-	 * ---------+-----+----------------
-	 * f1       | 1	  | 0
-	 * f2		| 2	  | 1
-	 * f1		| 1	  | 3 (should be 0)
-	 */
-	if (!entry->have_saved_counters)
-	{
-		entry->save_counters.table_counts = rel->pgstat_info->t_counts;
-		entry->have_saved_counters = true;
+	/* Save the counters at the beginning of relation open */
+	entry->save_counters.table_counts = rel->pgstat_info->t_counts;
 
-		if (rel->pgstat_info->trans)
-		{
-			entry->save_counters.table_counts.t_tuples_inserted = rel->pgstat_info->trans->tuples_inserted;
-			entry->save_counters.table_counts.t_tuples_updated = rel->pgstat_info->trans->tuples_updated;
-			entry->save_counters.table_counts.t_tuples_deleted = rel->pgstat_info->trans->tuples_deleted;
-		}
+	if (rel->pgstat_info->trans)
+	{
+		entry->save_counters.table_counts.t_tuples_inserted = rel->pgstat_info->trans->tuples_inserted;
+		entry->save_counters.table_counts.t_tuples_updated = rel->pgstat_info->trans->tuples_updated;
+		entry->save_counters.table_counts.t_tuples_deleted = rel->pgstat_info->trans->tuples_deleted;
 	}
 
 	MemoryContextSwitchTo(oldctx);
@@ -382,6 +369,7 @@ static void end_table_stat(Relation rel)
 	DatabaseObjectStats	   *entry;
 	PgStat_TableCounts	   *curr;
 	PgStat_TableCounts	   *save;
+	PgStat_TableCounts	   *final;
 
 	if (!rel->pgstat_info || rel->rd_id < FirstNormalObjectId || !object_usage_tab)
 		return;
@@ -399,30 +387,37 @@ static void end_table_stat(Relation rel)
 
 	/*
 	 * Adjust the stats to compensate for nested function calls.
-	 * Also ins/upd/del information needs to be obtined from the "trans" structure.
-	 * XXX: Even though those would be adjusted by rollback we don't care.
+     * It can be assumed that end_table_stat() may be called several times within
+	 * the same function so we need to accumulate the deltas.
+	 *
+	 * ins/upd/del information needs to be obtined from the "trans" structure.
+	 * Even though those would be adjusted by rollback we don't care.
+	 *
+	 * XXX: We don't handle situations with recursive calls nor when relation
+	 * is kept open across function calls.
 	 */
-	entry->counters.table_counts = rel->pgstat_info->t_counts;
-	curr = &entry->counters.table_counts;
-	save = &entry->save_counters.table_counts;
 
-	curr->t_numscans -= save->t_numscans;
-	curr->t_tuples_returned -= save->t_tuples_returned;
-	curr->t_tuples_fetched -= save->t_tuples_fetched;
-	curr->t_blocks_fetched -= save->t_blocks_fetched;
-	curr->t_blocks_hit -= save->t_blocks_hit;
+	curr = &rel->pgstat_info->t_counts;
+	save = &entry->save_counters.table_counts;
+	final = &entry->counters.table_counts;
+
+	final->t_numscans += curr->t_numscans - save->t_numscans;
+	final->t_tuples_returned += curr->t_tuples_returned - save->t_tuples_returned;
+	final->t_tuples_fetched += curr->t_tuples_fetched - save->t_tuples_fetched;
+	final->t_blocks_fetched += curr->t_blocks_fetched - save->t_blocks_fetched;
+	final->t_blocks_hit += curr->t_blocks_hit - save->t_blocks_hit;
 
 	if (rel->pgstat_info->trans)
 	{
-		curr->t_tuples_inserted = rel->pgstat_info->trans->tuples_inserted - save->t_tuples_inserted;
-		curr->t_tuples_updated = rel->pgstat_info->trans->tuples_updated - save->t_tuples_updated;
-		curr->t_tuples_deleted = rel->pgstat_info->trans->tuples_deleted - save->t_tuples_deleted;
+		final->t_tuples_inserted += rel->pgstat_info->trans->tuples_inserted - save->t_tuples_inserted;
+		final->t_tuples_updated += rel->pgstat_info->trans->tuples_updated - save->t_tuples_updated;
+		final->t_tuples_deleted += rel->pgstat_info->trans->tuples_deleted - save->t_tuples_deleted;
 	}
 	else
 	{
-		curr->t_tuples_inserted = save->t_tuples_inserted - save->t_tuples_inserted;
-		curr->t_tuples_updated = save->t_tuples_updated - save->t_tuples_updated;
-		curr->t_tuples_deleted = save->t_tuples_deleted - save->t_tuples_deleted;
+		final->t_tuples_inserted += curr->t_tuples_inserted - save->t_tuples_inserted;
+		final->t_tuples_updated += curr->t_tuples_updated - save->t_tuples_updated;
+		final->t_tuples_deleted += curr->t_tuples_deleted - save->t_tuples_deleted;
 	}
 }
 

@@ -2,6 +2,8 @@
  * BUGS:
  * - function call accounting is messed up if many functions are called within a tx
  * - table accounting is broken for CURSOR loops and nested functions
+ * - DELETE 1 yielded:
+ *	pg_stat_usage: r public.t oid=16455 parent=0 scans=2 tup_fetch=2 tup_ret=0 ins=0 upd=0 del=2 blks_fetch=4 blks_hit=4
  */
 #include <stdio.h>
 #include <stdlib.h>

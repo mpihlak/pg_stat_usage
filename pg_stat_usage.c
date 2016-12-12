@@ -193,8 +193,9 @@ static void report_stat(void)
 		 * To avoid sending the same counters over and over we need to clear the
 		 * counters after sending them to an external collector.
 		 * 
-		 * XXX: This of course clears the pg_stat_usage view in the same
-		 * backend, so that needs to be moved to the collector.
+		 * XXX: This of course also clears the pg_stat_usage view in the same
+		 * backend, so that needs to be moved to the collector. Presently the view's
+		 * contents are only good up to the end of the tx.
 		 */
 		entry->counters = all_zero_counters;
 		entry->save_counters = all_zero_counters;
@@ -290,6 +291,8 @@ static void start_function_stat(FunctionCallInfoData *fcinfo, PgStat_FunctionCal
 
 	entry = fetch_or_create_object(func_oid, current_function_oid, OBJ_KIND_FUNCTION, NULL);
 
+	entry->save_counters.function_counts = *fcu->fs;
+
 	call_stack = lcons_oid(current_function_parent, call_stack);
 
 	current_function_parent = current_function_oid;
@@ -320,11 +323,20 @@ static void end_function_stat(PgStat_FunctionCallUsage *fcu, bool finalize)
 
 	if (finalize)
 	{
+		PgStat_FunctionCounts *curr = &entry->counters.function_counts;
+		PgStat_FunctionCounts *save = &entry->save_counters.function_counts;
+
 		/*
-		 * Note that function counters should be already adjusted
-		 * to deal with nested calls. No need to adjust here.
+		 * "fcu" has global counters for this function execution, we need
+		 * to adjust this to accurately account per-caller stats.
 		 */
-		entry->counters.function_counts = *fcu->fs;
+		curr->f_numcalls = fcu->fs->f_numcalls - save->f_numcalls;
+
+		curr->f_self_time = fcu->fs->f_self_time;
+		INSTR_TIME_SUBTRACT(curr->f_self_time, save->f_self_time);
+
+		curr->f_total_time = fcu->fs->f_total_time;
+		INSTR_TIME_SUBTRACT(curr->f_total_time, save->f_total_time);
 	}
 
 	/* We need to "pop" the current function oid and parent */

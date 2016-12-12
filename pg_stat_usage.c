@@ -74,9 +74,10 @@ static void start_function_stat(FunctionCallInfoData *fcinfo, PgStat_FunctionCal
 static void end_function_stat(PgStat_FunctionCallUsage *fcu, bool finalize);
 static void start_table_stat(Relation rel);
 static void end_table_stat(Relation rel);
-DatabaseObjectStats *fetch_or_create_object(Oid obj_id, Oid parent_id, char obj_kind);
+DatabaseObjectStats *fetch_or_create_object(Oid obj_id, Oid parent_id, char obj_kind, Relation rel);
 
 PG_FUNCTION_INFO_V1(pg_stat_usage);
+PG_FUNCTION_INFO_V1(pg_stat_usage_reset);
 
 
 static report_stat_hook_type			prev_report_stat_hook = NULL;
@@ -189,9 +190,11 @@ static void report_stat(void)
 		}
 
 		/*
-		 * We need to clear the stats counter here if we're sending the stats
-		 * to an external collector. This of course breaks the pg_stat_usage VIEW 
-		 * in the backend, so that needs to be moved to the collector as well.
+		 * To avoid sending the same counters over and over we need to clear the
+		 * counters after sending them to an external collector.
+		 * 
+		 * XXX: This of course clears the pg_stat_usage view in the same
+		 * backend, so that needs to be moved to the collector.
 		 */
 		entry->counters = all_zero_counters;
 		entry->save_counters = all_zero_counters;
@@ -204,7 +207,7 @@ static void report_stat(void)
  *
  * Allocate the hash table if needed. Assume we're in TopMemoryContext
  */
-DatabaseObjectStats *fetch_or_create_object(Oid obj_id, Oid parent_id, char obj_kind)
+DatabaseObjectStats *fetch_or_create_object(Oid obj_id, Oid parent_id, char obj_kind, Relation rel)
 {
 	DatabaseObjectStats	   *entry;
 	ObjectKey				key;
@@ -219,7 +222,8 @@ DatabaseObjectStats *fetch_or_create_object(Oid obj_id, Oid parent_id, char obj_
 		hash_ctl.keysize = sizeof(key);
  		hash_ctl.entrysize = sizeof(DatabaseObjectStats);
 		hash_ctl.hash = tag_hash;
- 		object_usage_tab = hash_create("Object stat entries", 512, &hash_ctl, HASH_ELEM | HASH_BLOBS);
+ 		object_usage_tab = hash_create("Object stat entries", 512, &hash_ctl,
+									   HASH_ELEM | HASH_BLOBS);
 	}
 
 	key.obj_id = obj_id;
@@ -229,6 +233,7 @@ DatabaseObjectStats *fetch_or_create_object(Oid obj_id, Oid parent_id, char obj_
 
 	if (!found)
 	{
+		/* A new parent/child combination. Set up DatabaseObjectStats for it. */
 		entry->key = key;
 		entry->obj_kind = obj_kind;
 		entry->object_name = NULL;
@@ -236,6 +241,34 @@ DatabaseObjectStats *fetch_or_create_object(Oid obj_id, Oid parent_id, char obj_
 		entry->have_saved_counters = false;
 		memset(&entry->counters, 0, sizeof(entry->counters));
 		memset(&entry->save_counters, 0, sizeof(entry->save_counters));
+
+		if (ObjIsFunction(entry))
+		{
+			/*
+			 * Note: it may be tempting to cache these results. However this is
+			 * only useful when extreme number of unique lookups are performed.
+			 * As per microbenchmark SearchSysCache + namespace lookup takes
+			 * about 160 clock ticks to perform 10M lookups. In
+			 * comparison HTAB lookup takes 22 ticks for the same.
+			 */
+			Form_pg_proc	functup;
+			HeapTuple		tp;
+
+			tp = SearchSysCache(PROCOID, ObjectIdGetDatum(obj_id), 0, 0, 0);
+			if (!HeapTupleIsValid(tp))
+				elog(ERROR, "cache lookup failed for function %u", obj_id);
+			functup = (Form_pg_proc) GETSTRUCT(tp);
+
+			entry->object_name = pstrdup(NameStr(functup->proname));
+			entry->schema_name = get_namespace_name(functup->pronamespace);
+	 
+			ReleaseSysCache(tp);
+		}
+		else
+		{
+			entry->object_name = pstrdup(NameStr(rel->rd_rel->relname));
+			entry->schema_name = get_namespace_name(rel->rd_rel->relnamespace);
+		}
 	}
 
 	return entry;
@@ -255,32 +288,7 @@ static void start_function_stat(FunctionCallInfoData *fcinfo, PgStat_FunctionCal
 
 	oldctx = MemoryContextSwitchTo(TopMemoryContext);
 
-	entry = fetch_or_create_object(func_oid, current_function_oid, OBJ_KIND_FUNCTION);
-
-	if (IsNewEntry(entry))
-	{
-		/* 
-		 * A new parent/child combination. Set up DatabaseObjectStats for it.
-		 *
-		 * Note: it may be tempting to cache these results. However this is
-		 * only useful when extreme number of unique lookups is performed. As
-		 * per microbenchmark SearchSysCache + namespace lookup takes just
-		 * about 160 clock ticks to perform 10 000 000 lookups. In comparison
-		 * HTAB lookup takes 22 ticks for the same.
-		 */
-		Form_pg_proc	functup;
-		HeapTuple		tp;
-
-		tp = SearchSysCache(PROCOID, ObjectIdGetDatum(func_oid), 0, 0, 0);
-		if (!HeapTupleIsValid(tp))
-			elog(ERROR, "cache lookup failed for function %u", func_oid);
-		functup = (Form_pg_proc) GETSTRUCT(tp);
-
-		entry->object_name = pstrdup(NameStr(functup->proname));
-		entry->schema_name = get_namespace_name(functup->pronamespace);
- 
-		ReleaseSysCache(tp);
-	}
+	entry = fetch_or_create_object(func_oid, current_function_oid, OBJ_KIND_FUNCTION, NULL);
 
 	call_stack = lcons_oid(current_function_parent, call_stack);
 
@@ -341,13 +349,7 @@ static void start_table_stat(Relation rel)
 	oldctx = MemoryContextSwitchTo(TopMemoryContext);
 
 	/* Always use InvalidOid as func context -- or figure out how to make it work */
-	entry = fetch_or_create_object(rel->rd_id, current_function_oid, rel->rd_rel->relkind);
-
-	if (IsNewEntry(entry))
-	{
-		entry->object_name = pstrdup(NameStr(rel->rd_rel->relname));
-		entry->schema_name = get_namespace_name(rel->rd_rel->relnamespace);
-	} 
+	entry = fetch_or_create_object(rel->rd_id, current_function_oid, rel->rd_rel->relkind, rel);
 
 	/* Save the counters at the beginning of relation open */
 	entry->save_counters.table_counts = rel->pgstat_info->t_counts;
@@ -389,7 +391,7 @@ static void end_table_stat(Relation rel)
 
 	/*
 	 * Adjust the stats to compensate for nested function calls.
-     * It can be assumed that end_table_stat() may be called several times within
+	 * It can be assumed that end_table_stat() may be called several times within
 	 * the same function so we need to accumulate the deltas.
 	 *
 	 * ins/upd/del information needs to be obtined from the "trans" structure.
@@ -507,6 +509,29 @@ pg_stat_usage(PG_FUNCTION_ARGS)
 	}
 
 	tuplestore_donestoring(tupstore);
+
+	return (Datum) 0;
+}
+
+/*
+ * Reset the usage counters.
+ */
+Datum
+pg_stat_usage_reset(PG_FUNCTION_ARGS)
+{
+	DatabaseObjectStats	   *entry;
+	HASH_SEQ_STATUS			hstat;
+
+	if (!object_usage_tab)
+		return (Datum) 0;
+
+	hash_seq_init(&hstat, object_usage_tab);
+	while ((entry = hash_seq_search(&hstat)) != NULL)
+	{
+		entry->counters = all_zero_counters;
+		entry->save_counters = all_zero_counters;
+		entry->have_saved_counters = false;
+	}
 
 	return (Datum) 0;
 }

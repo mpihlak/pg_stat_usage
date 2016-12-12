@@ -12,7 +12,7 @@ there are no naming clashes.
 
 Test cases:
  [x] Simple function call
- [ ] Simple table access
+ [x] Simple table access
  [x] Nested function calls
  [ ] Nested function calls with table accesses
  [ ] Nested function call with an open cursor
@@ -105,7 +105,7 @@ def collect_stat_usage(con):
 class FunctionCallTester:
 
 	def __init__(self):
-		self.function_oids = {}
+		self.object_oids = {}
 		self.con = create_connection()
 
 	def run_all_tests(self):
@@ -137,12 +137,27 @@ class FunctionCallTester:
 			SELECT oid FROM pg_proc WHERE proname='%s'
 			""" % function_name
 		oid = run_sql_query(self.con, lookup_oid)[0][0]
-		self.function_oids[function_name] = oid
+		self.object_oids[function_name] = oid
 
-	def _perform_assertion(self, results, func_name, func_parent_name, assert_function, expected_value):
-		func_id = self.function_oids[func_name]
-		if func_parent_name:
-			parent_id = self.function_oids[func_parent_name]
+	def create_table(self, table_name, table_body):
+		create_statement = """
+			DROP TABLE IF EXISTS %s;
+			CREATE TABLE %s (
+			%s
+			)
+			""" % (table_name, table_name, table_body);
+		run_sql_cmd(self.con, create_statement)
+
+		lookup_oid = """
+			SELECT oid FROM pg_class WHERE relname='%s'
+			""" % table_name
+		oid = run_sql_query(self.con, lookup_oid)[0][0]
+		self.object_oids[table_name] = oid
+
+	def _perform_assertion(self, results, obj_name, obj_parent_name, assert_function, expected_value):
+		func_id = self.object_oids[obj_name]
+		if obj_parent_name:
+			parent_id = self.object_oids[obj_parent_name]
 		else:
 			parent_id = 0
 		usage_data = results.get(func_id, parent_id)
@@ -155,7 +170,7 @@ class FunctionCallTester:
 		else:
 			failure, msg = assert_function(usage_data, expected_value)
 
-		print '%s %s -> %s %s' % (failure and "FAIL" or "PASS", func_parent_name, func_name, msg)
+		print '%s %s -> %s %s' % (failure and "FAIL" or "PASS", obj_parent_name, obj_name, msg)
 
 		if failure:
 			print "Usage stats dump"
@@ -203,6 +218,13 @@ class FunctionCallTester:
 		self._perform_assertion(results, func_name, func_parent_name,
 								_fn_assert_num_calls, expect_num_calls)
 
+	def assert_table_scans(self, results, obj_name, obj_parent_name, expect_scans):
+		def _fn_assert_num_scans(usage_data, expect_scans):
+			if usage_data.num_scans != expect_scans:
+				return True, "assert_table_scans() %d != %d" % (usage_data.num_scans, expect_scans)
+			return False, "assert_table_scans() %d == %d" % (usage_data.num_scans, expect_scans)
+		self._perform_assertion(results, obj_name, obj_parent_name, _fn_assert_num_scans, expect_scans)
+
 	def execute_functions(self, funcnames):
 		"""Run the functions and collect usage data"""
 		run_sql_query(self.con, "SELECT * FROM pg_stat_usage_reset()")
@@ -210,9 +232,21 @@ class FunctionCallTester:
 			run_sql_query(self.con, "SELECT * FROM %s()" % f, do_commit=False)
 		return collect_stat_usage(self.con)
 
+	def execute_sql_statements(self, statements):
+		"""Run the SQL statements and collect usage data"""
+		run_sql_query(self.con, "SELECT * FROM pg_stat_usage_reset()")
+		for stmt in statements:
+			run_sql_query(self.con, stmt, do_commit=False)
+		return collect_stat_usage(self.con)
+
 	def execute_function(self, funcname):
 		"""Run a single function and collect usage data"""
 		return self.execute_functions([funcname])
+
+	def execute_single_statement(self, stmt):
+		"""Run a single SQL statement and collect usage data"""
+		return self.execute_sql_statements([stmt])
+
 
 	def test_01_simple_function(self):
 		self.create_simple_function("ff1", "PERFORM pg_sleep(0.010);")
@@ -259,6 +293,27 @@ class FunctionCallTester:
 		self.assert_num_calls(r, "ff1", "ff2", 2)
 		self.assert_total_time(r, "ff1", "ff2", 20)
 		self.assert_self_time(r, "ff1", "ff2", 20)
+
+	def test_00_create_table(self):
+		self.create_table("tt1", "i integer primary key, t text");
+		r = self.execute_single_statement("INSERT INTO tt1 SELECT i, 't' FROM generate_series(1,100) as i RETURNING i");
+		self.assert_table_scans(r, "tt1", None, 0)
+		# assert for 100 inserts
+
+	def test_01_count_table(self):
+		r = self.execute_single_statement("SELECT COUNT(*) FROM tt1")
+		self.assert_table_scans(r, "tt1", None, 1)
+		# assert for 100 tup_fetch
+
+	def test_02_count_table_from_function(self):
+		self.create_simple_function("ff4", "PERFORM COUNT(*) FROM tt1;")
+		r = self.execute_function("ff4");
+		self.assert_table_scans(r, "tt1", "ff4", 1)
+
+	def test_03_count_table_mixed(self):
+		r = self.execute_sql_statements(["SELECT ff4()", "SELECT COUNT(*) FROM tt1"]);
+		self.assert_table_scans(r, "tt1", "ff4", 1)
+		self.assert_table_scans(r, "tt1", None, 1)
 
 if __name__ == "__main__":
 	fctest = FunctionCallTester()

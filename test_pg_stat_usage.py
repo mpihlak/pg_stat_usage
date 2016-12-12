@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import psycopg2
+import time
 
 """
 Generate testing functions.
@@ -104,7 +105,7 @@ def collect_stat_usage(con):
 class FunctionCallTest:
 
 	def __init__(self):
-		self.functions = {}
+		self.function_oids = {}
 		self.con = create_connection()
 
 	def run_all_tests(self):
@@ -117,6 +118,9 @@ class FunctionCallTest:
 		for method in test_methods:
 			print "%s Running test: %s" % ('=' * 10, method)
 			eval("self.%s()" % method)
+
+			# a small sleep is needed for the stats collector to catch up
+			time.sleep(0.5)
 
 	def create_simple_function(self, function_name, function_body):
 		create_statement = """
@@ -133,31 +137,36 @@ class FunctionCallTest:
 			SELECT oid FROM pg_proc WHERE proname='%s'
 			""" % function_name
 		oid = run_sql_query(self.con, lookup_oid)[0][0]
-		self.functions[function_name] = oid
+		self.function_oids[function_name] = oid
 
 	def assert_calls(self, results, func_name, func_parent_name, calls):
-		func_id = self.functions[func_name]
+		func_id = self.function_oids[func_name]
 		if func_parent_name:
-			parent_id = self.functions[func_parent_name]
+			parent_id = self.function_oids[func_parent_name]
 		else:
 			parent_id = 0
 		usage_data = results.get(func_id, parent_id)
 
+		failed = False
+		status_msg = ""
+
 		if not usage_data:
-			status = "FAIL: usage_data=%s" % usage_data
+			failed = True
+			status_msg = "no usage data!"
 		elif usage_data.num_calls != calls:
-			status = "FAIL: usage_data.calls=%d" % (usage_data.num_calls)
-		else:
-			status = "PASS"
+			failed = True
+			status_msg = "calls=%d" % (usage_data.num_calls)
 
-		print 'assert_calls("%s -> %s", expected_calls=%d): %s' % \
-			(func_parent_name, func_name, calls, status)
+		print '%s assert_calls("%s -> %s", expected_calls=%d): %s' % \
+			(failed and "FAIL" or "PASS", func_parent_name, func_name, calls, status_msg)
 
-		for r in results.all():
-			print r
+		if failed:
+			for r in results.all():
+				print r
 
 	def execute_function(self, funcname):
 		"""Run the function and collect usage data"""
+		run_sql_query(self.con, "SELECT * FROM pg_stat_usage_reset()")
 		run_sql_query(self.con, "SELECT * FROM %s()" % funcname, do_commit=False)
 		return collect_stat_usage(self.con)
 

@@ -330,12 +330,12 @@ static void end_function_stat(PgStat_FunctionCallUsage *fcu, bool finalize)
 		 * "fcu" has global counters for this function execution, we need
 		 * to adjust this to accurately account per-caller stats.
 		 */
-		curr->f_numcalls = fcu->fs->f_numcalls - save->f_numcalls;
+		curr->f_numcalls += fcu->fs->f_numcalls - save->f_numcalls;
 
-		curr->f_self_time = fcu->fs->f_self_time;
+		INSTR_TIME_ADD(curr->f_self_time, fcu->fs->f_self_time);
 		INSTR_TIME_SUBTRACT(curr->f_self_time, save->f_self_time);
 
-		curr->f_total_time = fcu->fs->f_total_time;
+		INSTR_TIME_ADD(curr->f_total_time, fcu->fs->f_total_time);
 		INSTR_TIME_SUBTRACT(curr->f_total_time, save->f_total_time);
 	}
 

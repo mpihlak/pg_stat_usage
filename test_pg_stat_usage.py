@@ -148,30 +148,28 @@ class FunctionCallTester:
 		self.object_oids[table_name] = oid
 
 	def assert_value(self, results, obj_name, obj_parent_name, item_name, expected_value, tolerance=0):
-		func_id = self.object_oids[obj_name]
-		if obj_parent_name:
-			parent_id = self.object_oids[obj_parent_name]
-		else:
-			parent_id = 0
+		try:
+			func_id = self.object_oids[obj_name]
+			if obj_parent_name:
+				parent_id = self.object_oids[obj_parent_name]
+			else:
+				parent_id = 0
 
-		usage_data = results.get(func_id, parent_id)
-		usage_value = usage_data.get(item_name)
+			usage_data = results.get(func_id, parent_id)
+			usage_value = usage_data.get(item_name)
 
-		if abs(expected_value - usage_value) > tolerance:
-			status = "FAIL"
-			op = "!"
+			if abs(expected_value - usage_value) > tolerance:
+				debug("Usage stats dump")
+				debug("----------------")
+				for r in results.all():
+					debug(r)
 
-			debug("Usage stats dump")
-			debug("----------------")
-			for r in results.all():
-				debug(r)
-		else:
-			status = "PASS"
-			op = "="
+				raise Exception("%d != %d" % (expected_value, usage_value))
 
-		print "%s assert_value(%s -> %s, %s, %d) %s= %d" % \
-			(status, obj_parent_name, obj_name, item_name, 
-			 expected_value, op, usage_value)
+		except Exception, e:
+			print "FAILED assert_value(%s -> %s, %s, %d): %s" % \
+				(obj_parent_name, obj_name, item_name, 
+				 expected_value, e)
 
 	def execute_functions(self, funcnames):
 		"""Run the functions and collect usage data"""

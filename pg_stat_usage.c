@@ -160,7 +160,8 @@ static void report_stat(void)
 
 		if (ObjIsFunction(entry))
 		{
-			elog(LOG, "pg_stat_usage: %c %s.%s oid=%u parent=%u calls=%lu total_time=%lu self_time=%lu",
+			elog(LOG, "pg_stat_usage: %c %s.%s object_oid=%u parent_oid=%u num_calls=%lu "
+					  "total_time=%lu self_time=%lu",
 					entry->obj_kind,
 					entry->schema_name,
 					entry->object_name,
@@ -172,8 +173,8 @@ static void report_stat(void)
 		}
 		else
 		{
-			elog(LOG, "pg_stat_usage: %c %s.%s oid=%u parent=%u scans=%lu tup_fetch=%lu "
-					  "tup_ret=%lu ins=%lu upd=%lu del=%lu blks_fetch=%lu blks_hit=%lu",
+			elog(LOG, "pg_stat_usage: %c %s.%s object_oid=%u parent_oid=%u num_scans=%lu n_tup_fetch=%lu "
+					  "n_tup_ret=%lu n_tup_ins=%lu n_tup_upd=%lu n_tup_del=%lu blks_fetch=%lu blks_hit=%lu",
 					entry->obj_kind,
 					entry->schema_name,
 					entry->object_name,

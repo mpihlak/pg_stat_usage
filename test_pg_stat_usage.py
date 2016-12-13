@@ -58,19 +58,13 @@ def create_connection(dbname=""):
 	return con
 
 class PGStatUsageRecord:
-	def __init__(self, r):
-		self.items = dict(
-			object_oid=r[0],
-			parent_oid = r[1],
-			object_type = r[2],
-			object_schema = r[3],
-			object_name = r[4],
-			num_calls = r[5],
-			num_scans = r[6],
-			total_time = int(r[7] / 1000),	# convert times to ms
-			self_time = int(r[8] / 1000))
+	def __init__(self, columns, values):
+		self.items = dict(zip(columns, values))
 		self.object_oid = self.items['object_oid']
 		self.parent_oid = self.items['parent_oid']
+		# times to ms
+		self.items['total_time'] /= 1000
+		self.items['self_time'] /= 1000
 
 	def get(self, item_name):
 		return self.items.get(item_name)
@@ -92,21 +86,14 @@ class PGStatUsage:
 		return self.usage_dict.values()
 
 def collect_stat_usage(con):
-	stat_query = """
-		SELECT object_oid,
-               parent_oid,
-               object_type,
-               object_schema,
-               object_name,
-               num_calls,
-               num_scans,
-               total_time,
-               self_time
-         FROM  pg_stat_usage
-		"""
+	stat_query = "SELECT * FROM pg_stat_usage"
+
 	pgsu = PGStatUsage()
-	for r in run_sql_query(con, stat_query):
-		ur = PGStatUsageRecord(r)
+	cur = con.cursor()
+	cur.execute(stat_query)
+	columns = [ c.name for c in cur.description ]
+	for values in cur.fetchall():
+		ur = PGStatUsageRecord(columns, values)
 		pgsu.set(ur.object_oid, ur.parent_oid, ur)
 	return pgsu
 
@@ -257,12 +244,12 @@ class FunctionCallTester:
 		self.create_table("tt1", "i integer primary key, t text");
 		r = self.execute_single_statement("INSERT INTO tt1 SELECT i, 't' FROM generate_series(1,100) as i RETURNING i");
 		self.assert_value(r, "tt1", None, "num_scans", 0)
-		# assert for 100 inserts
+		self.assert_value(r, "tt1", None, "n_tup_ins", 100)
 
 	def test_06_count_table(self):
 		r = self.execute_single_statement("SELECT COUNT(*) FROM tt1")
 		self.assert_value(r, "tt1", None, "num_scans", 1)
-		# assert for 100 tup_fetch
+		self.assert_value(r, "tt1", None, "n_tup_ret", 100)
 
 	def test_07_count_table_from_function(self):
 		self.create_simple_function("ff4", "PERFORM COUNT(*) FROM tt1;")

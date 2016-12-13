@@ -26,6 +26,8 @@ Design goals
 
 debug_mode = False
 
+TIME_DIFF_TOLERANCE = 10
+
 def debug(msg):
 	if debug_mode:
 		print msg
@@ -57,21 +59,27 @@ def create_connection(dbname=""):
 
 class PGStatUsageRecord:
 	def __init__(self, r):
-		self.object_oid = r[0]
-		self.parent_oid = r[1]
-		self.object_type = r[2]
-		self.object_schema = r[3]
-		self.object_name = r[4]
-		self.num_calls = r[5]
-		self.num_scans = r[6]
-		self.total_time = r[7]
-		self.self_time = r[8]
+		self.items = dict(
+			object_oid=r[0],
+			parent_oid = r[1],
+			object_type = r[2],
+			object_schema = r[3],
+			object_name = r[4],
+			num_calls = r[5],
+			num_scans = r[6],
+			total_time = int(r[7] / 1000),	# convert times to ms
+			self_time = int(r[8] / 1000))
+		self.object_oid = self.items['object_oid']
+		self.parent_oid = self.items['parent_oid']
+
+	def get(self, item_name):
+		return self.items.get(item_name)
 
 	def __str__(self):
-		return "%s %s.%s oid=%d parent=%d calls=%d scans=%d total=%d self=%d" % \
-			(self.object_type, self.object_schema, self.object_name,
-			 self.object_oid, self.parent_oid, self.num_calls, self.num_scans,
-			 self.total_time, self.self_time)
+		keys = self.items.keys()
+		keys.sort()
+		vstr = " ".join([ "%s=%d" % (k, self.items[k]) for k in keys ])
+		return vstr
 
 class PGStatUsage:
 	def __init__(self):
@@ -119,9 +127,6 @@ class FunctionCallTester:
 			print "%s Running test: %s" % ('=' * 10, method)
 			eval("self.%s()" % method)
 
-			# a small sleep is needed for the stats collector to catch up
-			time.sleep(0.5)
-
 	def create_simple_function(self, function_name, function_body):
 		create_statement = """
 			CREATE OR REPLACE FUNCTION %s() RETURNS void AS
@@ -154,76 +159,31 @@ class FunctionCallTester:
 		oid = run_sql_query(self.con, lookup_oid)[0][0]
 		self.object_oids[table_name] = oid
 
-	def _perform_assertion(self, results, obj_name, obj_parent_name, assert_function, expected_value):
+	def assert_value(self, results, obj_name, obj_parent_name, item_name, expected_value, tolerance=0):
 		func_id = self.object_oids[obj_name]
 		if obj_parent_name:
 			parent_id = self.object_oids[obj_parent_name]
 		else:
 			parent_id = 0
+
 		usage_data = results.get(func_id, parent_id)
+		usage_value = usage_data.get(item_name)
 
-		failed = False
-		status_msg = ""
+		if abs(expected_value - usage_value) > tolerance:
+			status = "FAIL"
+			op = "!"
 
-		if not usage_data:
-			failure, msg = True, "no usage data!"
-		else:
-			failure, msg = assert_function(usage_data, expected_value)
-
-		print '%s %s -> %s %s' % (failure and "FAIL" or "PASS", obj_parent_name, obj_name, msg)
-
-		if failure:
-			print "Usage stats dump"
-			print "----------------"
+			debug("Usage stats dump")
+			debug("----------------")
 			for r in results.all():
-				print r
+				debug(r)
+		else:
+			status = "PASS"
+			op = "="
 
-	def assert_total_time(self, results, func_name, func_parent_name, duration_ms):
-		"""Validate if total_time meets our expectations"""
-
-		def _fn_assert_total_time(usage_data, expect_total_time_ms):
-			tolerance_ms = 10
-			total_time_ms = int(usage_data.total_time / 1000)
-			if abs(total_time_ms - expect_total_time_ms) > tolerance_ms:
-				return True, "assert_total_time() %d != %d" % \
-							 (total_time_ms, expect_total_time_ms)
-			return False, "assert_total_time() %d ~ %d" % \
-				(total_time_ms, expect_total_time_ms)
-
-		self._perform_assertion(results, func_name, func_parent_name,
-								_fn_assert_total_time, duration_ms)
-
-	def assert_self_time(self, results, func_name, func_parent_name, duration_ms):
-		"""Validate if self_time meets our expectations
-		"""
-		def _fn_assert_self_time(usage_data, expect_self_time_ms):
-			tolerance_ms = 10
-			self_time_ms = int(usage_data.self_time / 1000)
-			if abs(self_time_ms - expect_self_time_ms) > tolerance_ms:
-				return True, "assert_self_time() %d != %d" % \
-							 (self_time_ms, expect_self_time_ms)
-			return False, "assert_self_time() %d ~ %d" % \
-				(self_time_ms, expect_self_time_ms)
-
-		self._perform_assertion(results, func_name, func_parent_name,
-								_fn_assert_self_time, duration_ms)
-
-	def assert_num_calls(self, results, func_name, func_parent_name, expect_num_calls):
-		"""Validate if number of calls matches expected"""
-		def _fn_assert_num_calls(usage_data, expect_num_calls):
-			if usage_data.num_calls != expect_num_calls:
-				return True, "assert_num_calls() %d != %d" % (usage_data.num_calls, expect_num_calls)
-			return False, "assert_num_calls() %d == %d" % (usage_data.num_calls, expect_num_calls)
-
-		self._perform_assertion(results, func_name, func_parent_name,
-								_fn_assert_num_calls, expect_num_calls)
-
-	def assert_table_scans(self, results, obj_name, obj_parent_name, expect_scans):
-		def _fn_assert_num_scans(usage_data, expect_scans):
-			if usage_data.num_scans != expect_scans:
-				return True, "assert_table_scans() %d != %d" % (usage_data.num_scans, expect_scans)
-			return False, "assert_table_scans() %d == %d" % (usage_data.num_scans, expect_scans)
-		self._perform_assertion(results, obj_name, obj_parent_name, _fn_assert_num_scans, expect_scans)
+		print "%s assert_value(%s -> %s, %s, %d) %s= %d" % \
+			(status, obj_parent_name, obj_name, item_name, 
+			 expected_value, op, usage_value)
 
 	def execute_functions(self, funcnames):
 		"""Run the functions and collect usage data"""
@@ -247,73 +207,72 @@ class FunctionCallTester:
 		"""Run a single SQL statement and collect usage data"""
 		return self.execute_sql_statements([stmt])
 
-
 	def test_01_simple_function(self):
 		self.create_simple_function("ff1", "PERFORM pg_sleep(0.010);")
 		r = self.execute_function("ff1")
 
-		self.assert_num_calls(r, "ff1", None, 1)
-		self.assert_total_time(r, "ff1", None, 10)
-		self.assert_self_time(r, "ff1", None, 10)
+		self.assert_value(r, "ff1", None, "num_calls", 1)
+		self.assert_value(r, "ff1", None, "total_time", 10, TIME_DIFF_TOLERANCE)
+		self.assert_value(r, "ff1", None, "self_time", 10, TIME_DIFF_TOLERANCE)
 
 	def test_02_nested_functions(self):
 		self.create_simple_function("ff2", "PERFORM ff1();")
 		r = self.execute_function("ff2")
 
-		self.assert_num_calls(r, "ff2", None, 1)
-		self.assert_total_time(r, "ff2", None, 10)
-		self.assert_self_time(r, "ff2", None, 1)
+		self.assert_value(r, "ff2", None, "num_calls", 1)
+		self.assert_value(r, "ff2", None, "total_time", 10, TIME_DIFF_TOLERANCE)
+		self.assert_value(r, "ff2", None, "self_time", 1, TIME_DIFF_TOLERANCE)
 
-		self.assert_num_calls(r, "ff1", "ff2", 1)
-		self.assert_total_time(r, "ff1", "ff2", 10)
-		self.assert_self_time(r, "ff1", "ff2", 10)
+		self.assert_value(r, "ff1", "ff2", "num_calls", 1)
+		self.assert_value(r, "ff1", "ff2", "total_time", 10, TIME_DIFF_TOLERANCE)
+		self.assert_value(r, "ff1", "ff2", "self_time", 10, TIME_DIFF_TOLERANCE)
 
 	def test_03_nested_functions(self):
 		r = self.execute_functions(["ff1", "ff2" ])
-		self.assert_num_calls(r, "ff1", None, 1)
-		self.assert_total_time(r, "ff1", None, 10)
-		self.assert_self_time(r, "ff1", None, 10)
+		self.assert_value(r, "ff1", None, "num_calls", 1)
+		self.assert_value(r, "ff1", None, "total_time", 10)
+		self.assert_value(r, "ff1", None, "self_time", 10)
 
-		self.assert_num_calls(r, "ff2", None, 1)
-		self.assert_total_time(r, "ff2", None, 10)
-		self.assert_self_time(r, "ff2", None, 1)
+		self.assert_value(r, "ff2", None, "num_calls", 1)
+		self.assert_value(r, "ff2", None, "total_time", 10, TIME_DIFF_TOLERANCE)
+		self.assert_value(r, "ff2", None, "self_time", 1, TIME_DIFF_TOLERANCE)
 
-		self.assert_num_calls(r, "ff1", "ff2", 1)
-		self.assert_total_time(r, "ff1", "ff2", 10)
-		self.assert_self_time(r, "ff1", "ff2", 10)
+		self.assert_value(r, "ff1", "ff2", "num_calls", 1)
+		self.assert_value(r, "ff1", "ff2", "total_time", 10, TIME_DIFF_TOLERANCE)
+		self.assert_value(r, "ff1", "ff2", "self_time", 10, TIME_DIFF_TOLERANCE)
 
 	def test_04_call_count_is_cumulative(self):
 		"""Validate that the counts are cumulative"""
 		r = self.execute_functions(["ff2", "ff2" ])
 
-		self.assert_num_calls(r, "ff2", None, 2)
-		self.assert_total_time(r, "ff2", None, 20)
-		self.assert_self_time(r, "ff2", None, 1)
+		self.assert_value(r, "ff2", None, "num_calls", 2)
+		self.assert_value(r, "ff2", None, "total_time", 20, TIME_DIFF_TOLERANCE)
+		self.assert_value(r, "ff2", None, "self_time", 1, TIME_DIFF_TOLERANCE)
 
-		self.assert_num_calls(r, "ff1", "ff2", 2)
-		self.assert_total_time(r, "ff1", "ff2", 20)
-		self.assert_self_time(r, "ff1", "ff2", 20)
+		self.assert_value(r, "ff1", "ff2", "num_calls", 2)
+		self.assert_value(r, "ff1", "ff2", "total_time", 20, TIME_DIFF_TOLERANCE)
+		self.assert_value(r, "ff1", "ff2", "self_time", 20, TIME_DIFF_TOLERANCE)
 
-	def test_00_create_table(self):
+	def test_05_create_table(self):
 		self.create_table("tt1", "i integer primary key, t text");
 		r = self.execute_single_statement("INSERT INTO tt1 SELECT i, 't' FROM generate_series(1,100) as i RETURNING i");
-		self.assert_table_scans(r, "tt1", None, 0)
+		self.assert_value(r, "tt1", None, "num_scans", 0)
 		# assert for 100 inserts
 
-	def test_01_count_table(self):
+	def test_06_count_table(self):
 		r = self.execute_single_statement("SELECT COUNT(*) FROM tt1")
-		self.assert_table_scans(r, "tt1", None, 1)
+		self.assert_value(r, "tt1", None, "num_scans", 1)
 		# assert for 100 tup_fetch
 
-	def test_02_count_table_from_function(self):
+	def test_07_count_table_from_function(self):
 		self.create_simple_function("ff4", "PERFORM COUNT(*) FROM tt1;")
 		r = self.execute_function("ff4");
-		self.assert_table_scans(r, "tt1", "ff4", 1)
+		self.assert_value(r, "tt1", "ff4", "num_scans", 1)
 
-	def test_03_count_table_mixed(self):
+	def test_08_count_table_mixed(self):
 		r = self.execute_sql_statements(["SELECT ff4()", "SELECT COUNT(*) FROM tt1"]);
-		self.assert_table_scans(r, "tt1", "ff4", 1)
-		self.assert_table_scans(r, "tt1", None, 1)
+		self.assert_value(r, "tt1", "ff4", "num_scans", 1)
+		self.assert_value(r, "tt1", None, "num_scans", 1)
 
 if __name__ == "__main__":
 	fctest = FunctionCallTester()

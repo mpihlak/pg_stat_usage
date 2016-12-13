@@ -95,6 +95,7 @@ def collect_stat_usage(con):
 	for values in cur.fetchall():
 		ur = PGStatUsageRecord(columns, values)
 		pgsu.set(ur.object_oid, ur.parent_oid, ur)
+	con.commit()
 	return pgsu
 
 class FunctionCallTester:
@@ -183,7 +184,7 @@ class FunctionCallTester:
 		"""Run the SQL statements and collect usage data"""
 		run_sql_query(self.con, "SELECT * FROM pg_stat_usage_reset()")
 		for stmt in statements:
-			run_sql_query(self.con, stmt, do_commit=False)
+			run_sql_cmd(self.con, stmt, do_commit=False)
 		return collect_stat_usage(self.con)
 
 	def execute_function(self, funcname):
@@ -242,7 +243,7 @@ class FunctionCallTester:
 
 	def test_05_create_table(self):
 		self.create_table("tt1", "i integer primary key, t text");
-		r = self.execute_single_statement("INSERT INTO tt1 SELECT i, 't' FROM generate_series(1,100) as i RETURNING i");
+		r = self.execute_single_statement("INSERT INTO tt1 SELECT i, 't' FROM generate_series(1,100) as i");
 		self.assert_value(r, "tt1", None, "num_scans", 0)
 		self.assert_value(r, "tt1", None, "n_tup_ins", 100)
 
@@ -260,6 +261,16 @@ class FunctionCallTester:
 		r = self.execute_sql_statements(["SELECT ff4()", "SELECT COUNT(*) FROM tt1"]);
 		self.assert_value(r, "tt1", "ff4", "num_scans", 1)
 		self.assert_value(r, "tt1", None, "num_scans", 1)
+
+	def test_09_update_table_direct(self):
+		r = self.execute_single_statement("UPDATE tt1 SET t='updated'")
+		self.assert_value(r, "tt1", None, "num_scans", 1)
+		self.assert_value(r, "tt1", None, "n_tup_upd", 100)
+
+	def test_10_delete_table_direct(self):
+		r = self.execute_single_statement("DELETE FROM tt1")
+		self.assert_value(r, "tt1", None, "num_scans", 1)
+		self.assert_value(r, "tt1", None, "n_tup_del", 100)
 
 if __name__ == "__main__":
 	fctest = FunctionCallTester()

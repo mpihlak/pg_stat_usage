@@ -481,8 +481,8 @@ pg_stat_usage(PG_FUNCTION_ARGS)
 		hash_seq_init(&hstat, object_usage_tab);
 		while ((entry = hash_seq_search(&hstat)) != NULL)
 		{
-			Datum		values[9];
-			bool		nulls[9];
+			Datum		values[16];
+			bool		nulls[16];
 			char		buf[2];
 			int			i = 0;
 
@@ -507,6 +507,13 @@ pg_stat_usage(PG_FUNCTION_ARGS)
 				values[i++] = Int64GetDatumFast(0);
 				values[i++] = Int64GetDatumFast(INSTR_TIME_GET_MICROSEC(entry->counters.function_counts.f_total_time));
 				values[i++] = Int64GetDatumFast(INSTR_TIME_GET_MICROSEC(entry->counters.function_counts.f_self_time));
+				values[i++] = Int64GetDatumFast(0);
+				values[i++] = Int64GetDatumFast(0);
+				values[i++] = Int64GetDatumFast(0);
+				values[i++] = Int64GetDatumFast(0);
+				values[i++] = Int64GetDatumFast(0);
+				values[i++] = Int64GetDatumFast(0);
+				values[i++] = Int64GetDatumFast(0);
 			}
 			else
 			{
@@ -514,6 +521,13 @@ pg_stat_usage(PG_FUNCTION_ARGS)
 				values[i++] = Int64GetDatumFast(entry->counters.table_counts.t_numscans);
 				values[i++] = Int64GetDatumFast(0);
 				values[i++] = Int64GetDatumFast(0);
+				values[i++] = Int64GetDatumFast(entry->counters.table_counts.t_tuples_fetched);
+				values[i++] = Int64GetDatumFast(entry->counters.table_counts.t_tuples_returned);
+				values[i++] = Int64GetDatumFast(entry->counters.table_counts.t_tuples_inserted);
+				values[i++] = Int64GetDatumFast(entry->counters.table_counts.t_tuples_updated);
+				values[i++] = Int64GetDatumFast(entry->counters.table_counts.t_tuples_deleted);
+				values[i++] = Int64GetDatumFast(entry->counters.table_counts.t_blocks_fetched);
+				values[i++] = Int64GetDatumFast(entry->counters.table_counts.t_blocks_hit);
 			}
 
 			tuplestore_putvalues(tupstore, tupdesc, values, nulls);

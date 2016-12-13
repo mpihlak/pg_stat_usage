@@ -10,7 +10,14 @@ CREATE FUNCTION pg_stat_usage(
 	OUT num_calls int8,
 	OUT num_scans int8,
 	OUT total_time int8,
-	OUT self_time int8
+	OUT self_time int8,
+	OUT n_tup_fetch int8,
+	OUT n_tup_ret int8,
+	OUT n_tup_ins int8,
+	OUT n_tup_upd int8,
+	OUT n_tup_del int8,
+	OUT blks_fetch int8,
+	OUT blks_hit int8
 )
 RETURNS SETOF record
 AS 'MODULE_PATHNAME'

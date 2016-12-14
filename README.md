@@ -25,10 +25,22 @@ In an interactive session
 ```
 LOAD 'pg_stat_usage';
 ...
+-- run a function
+select * from ff3();
+
+-- get the stats
 select * from pg_stat_usage();
+
+ t | schema |  object_name  | object_oid | parent_oid | num_calls | num_scans
+---+--------+---------------+------------+------------+-----------+-----------
+ r | public | tt1           |      17447 |      16466 |         0 |         1
+ F | public | pg_stat_usage |      16760 |          0 |         1 |         0
+ i | public | tt1_pkey      |      17453 |      16466 |         0 |         0
+ F | public | ff3           |      16466 |          0 |         1 |         0
+(4 rows)
 ```
 
-Alternatively modify postgresql.conf to include:
+To enable pg\_stat\_usage for the entire cluster, modify postgresql.conf to include:
 
 ```
 local_preload_libraries = 'pg_stat_usage'

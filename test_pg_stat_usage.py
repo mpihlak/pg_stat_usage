@@ -72,8 +72,8 @@ class PGStatUsageRecord:
 	def __str__(self):
 		keys = self.items.keys()
 		keys.sort()
-		vstr = " ".join([ "%s=%d" % (k, self.items[k]) for k in keys ])
-		return vstr
+		vstr = " ".join([ "%s=%s" % (k, str(self.items[k])) for k in keys ])
+		return "PGStatUsageRecord: " + vstr
 
 class PGStatUsage:
 	def __init__(self):
@@ -103,6 +103,14 @@ class FunctionCallTester:
 	def __init__(self):
 		self.object_oids = {}
 		self.con = create_connection()
+		self.setup_tests()
+
+	def run_single_test(self, test_name):
+		if not callable(getattr(self, test_name)):
+			raise Exception("%s: not a test method" % test_name)
+		print "%s Running test: %s" % ('=' * 10, test_name)
+		eval("self.%s()" % test_name)
+		#time.sleep(0.5)
 
 	def run_all_tests(self):
 		test_methods = []
@@ -112,8 +120,7 @@ class FunctionCallTester:
 		test_methods.sort()
 
 		for method in test_methods:
-			print "%s Running test: %s" % ('=' * 10, method)
-			eval("self.%s()" % method)
+			self.run_single_test(method)
 
 	def create_simple_function(self, function_name, function_body):
 		create_statement = """
@@ -146,6 +153,12 @@ class FunctionCallTester:
 			""" % table_name
 		oid = run_sql_query(self.con, lookup_oid)[0][0]
 		self.object_oids[table_name] = oid
+
+	def setup_tests(self):
+		self.create_table("tt1", "i integer primary key, t text");
+		self.create_simple_function("ff1", "PERFORM pg_sleep(0.010);")
+		self.create_simple_function("ff2", "PERFORM ff1();")
+		self.create_simple_function("ff3", "PERFORM COUNT(*) FROM tt1;")
 
 	def assert_value(self, results, obj_name, obj_parent_name, item_name, expected_value, tolerance=0):
 		try:
@@ -194,7 +207,6 @@ class FunctionCallTester:
 		return self.execute_sql_statements([stmt])
 
 	def test_01_simple_function(self):
-		self.create_simple_function("ff1", "PERFORM pg_sleep(0.010);")
 		r = self.execute_function("ff1")
 
 		self.assert_value(r, "ff1", None, "num_calls", 1)
@@ -202,7 +214,6 @@ class FunctionCallTester:
 		self.assert_value(r, "ff1", None, "self_time", 10, TIME_DIFF_TOLERANCE)
 
 	def test_02_nested_functions(self):
-		self.create_simple_function("ff2", "PERFORM ff1();")
 		r = self.execute_function("ff2")
 
 		self.assert_value(r, "ff2", None, "num_calls", 1)
@@ -216,8 +227,8 @@ class FunctionCallTester:
 	def test_03_nested_functions(self):
 		r = self.execute_functions(["ff1", "ff2" ])
 		self.assert_value(r, "ff1", None, "num_calls", 1)
-		self.assert_value(r, "ff1", None, "total_time", 10)
-		self.assert_value(r, "ff1", None, "self_time", 10)
+		self.assert_value(r, "ff1", None, "total_time", 10, TIME_DIFF_TOLERANCE)
+		self.assert_value(r, "ff1", None, "self_time", 10, TIME_DIFF_TOLERANCE)
 
 		self.assert_value(r, "ff2", None, "num_calls", 1)
 		self.assert_value(r, "ff2", None, "total_time", 10, TIME_DIFF_TOLERANCE)
@@ -239,8 +250,7 @@ class FunctionCallTester:
 		self.assert_value(r, "ff1", "ff2", "total_time", 20, TIME_DIFF_TOLERANCE)
 		self.assert_value(r, "ff1", "ff2", "self_time", 20, TIME_DIFF_TOLERANCE)
 
-	def test_05_create_table(self):
-		self.create_table("tt1", "i integer primary key, t text");
+	def test_05_populate_table(self):
 		r = self.execute_single_statement("INSERT INTO tt1 SELECT i, 't' FROM generate_series(1,100) as i");
 		self.assert_value(r, "tt1", None, "num_scans", 0)
 		self.assert_value(r, "tt1", None, "n_tup_ins", 100)
@@ -251,26 +261,32 @@ class FunctionCallTester:
 		self.assert_value(r, "tt1", None, "n_tup_ret", 100)
 
 	def test_07_count_table_from_function(self):
-		self.create_simple_function("ff4", "PERFORM COUNT(*) FROM tt1;")
-		r = self.execute_function("ff4");
-		self.assert_value(r, "tt1", "ff4", "num_scans", 1)
+		r = self.execute_function("ff3");
+		self.assert_value(r, "tt1", "ff3", "num_scans", 1)
 
 	def test_08_count_table_mixed(self):
-		r = self.execute_sql_statements(["SELECT ff4()", "SELECT COUNT(*) FROM tt1"]);
-		self.assert_value(r, "tt1", "ff4", "num_scans", 1)
+		r = self.execute_sql_statements(["SELECT ff3()", "SELECT COUNT(*) FROM tt1"]);
+		self.assert_value(r, "tt1", "ff3", "num_scans", 1)
 		self.assert_value(r, "tt1", None, "num_scans", 1)
 
 	def test_09_update_table_direct(self):
 		r = self.execute_single_statement("UPDATE tt1 SET t='updated'")
 		self.assert_value(r, "tt1", None, "num_scans", 1)
+		self.assert_value(r, "tt1", None, "n_tup_del", 0)
 		self.assert_value(r, "tt1", None, "n_tup_upd", 100)
+		self.assert_value(r, "tt1", None, "n_tup_ins", 0)
 
-	def test_10_delete_table_direct(self):
+	def xtest_10_delete_table_direct(self):
 		r = self.execute_single_statement("DELETE FROM tt1")
 		self.assert_value(r, "tt1", None, "num_scans", 1)
 		self.assert_value(r, "tt1", None, "n_tup_del", 100)
+		self.assert_value(r, "tt1", None, "n_tup_upd", 0)
+		self.assert_value(r, "tt1", None, "n_tup_ins", 0)
 
 if __name__ == "__main__":
 	fctest = FunctionCallTester()
+	#fctest.run_single_test('test_05_populate_table')
+	#fctest.run_single_test('test_09_update_table_direct')
+	#fctest.run_single_test('test_10_delete_table_direct')
 	fctest.run_all_tests()
 

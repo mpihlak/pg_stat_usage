@@ -24,7 +24,7 @@ Set up PostgreSQL module development environment and run `make install`. pg\_con
 In an interactive session
 ```
 LOAD 'pg_stat_usage';
-...
+
 -- run a function
 select * from ff3();
 

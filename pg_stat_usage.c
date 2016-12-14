@@ -355,23 +355,22 @@ static void start_table_stat(Relation rel)
 {
 	DatabaseObjectStats	*entry;
 	MemoryContext 		oldctx;
+	PgStat_TableXactStatus *xact;
 
 	if (!rel->pgstat_info || rel->rd_id < FirstNormalObjectId)
 		return;
 
 	oldctx = MemoryContextSwitchTo(TopMemoryContext);
 
-	/* Always use InvalidOid as func context -- or figure out how to make it work */
 	entry = fetch_or_create_object(rel->rd_id, current_function_oid, rel->rd_rel->relkind, rel);
 
 	/* Save the counters at the beginning of relation open */
 	entry->save_counters.table_counts = rel->pgstat_info->t_counts;
-
-	if (rel->pgstat_info->trans)
+	for (xact = rel->pgstat_info->trans; xact != NULL; xact = xact->upper)
 	{
-		entry->save_counters.table_counts.t_tuples_inserted = rel->pgstat_info->trans->tuples_inserted;
-		entry->save_counters.table_counts.t_tuples_updated = rel->pgstat_info->trans->tuples_updated;
-		entry->save_counters.table_counts.t_tuples_deleted = rel->pgstat_info->trans->tuples_deleted;
+		entry->save_counters.table_counts.t_tuples_inserted = xact->tuples_inserted;
+		entry->save_counters.table_counts.t_tuples_updated = xact->tuples_updated;
+		entry->save_counters.table_counts.t_tuples_deleted = xact->tuples_deleted;
 	}
 
 	MemoryContextSwitchTo(oldctx);
@@ -387,6 +386,7 @@ static void end_table_stat(Relation rel)
 	PgStat_TableCounts	   *curr;
 	PgStat_TableCounts	   *save;
 	PgStat_TableCounts	   *final;
+	PgStat_TableXactStatus *xact;
 
 	if (!rel->pgstat_info || rel->rd_id < FirstNormalObjectId || !object_usage_tab)
 		return;
@@ -407,10 +407,10 @@ static void end_table_stat(Relation rel)
 	 * It can be assumed that end_table_stat() may be called several times within
 	 * the same function so we need to accumulate the deltas.
 	 *
-	 * ins/upd/del information needs to be obtined from the "trans" structure.
+	 * ins/upd/del information needs to be obtained from the "trans" structure.
 	 * Even though those would be adjusted by rollback we don't care.
 	 *
-	 * XXX: We don't handle situations with recursive calls nor when relation
+	 * BUG: We don't handle situations with recursive calls nor when relation
 	 * is kept open across function calls.
 	 */
 
@@ -418,24 +418,30 @@ static void end_table_stat(Relation rel)
 	save = &entry->save_counters.table_counts;
 	final = &entry->counters.table_counts;
 
-	final->t_numscans += curr->t_numscans - save->t_numscans;
-	final->t_tuples_returned += curr->t_tuples_returned - save->t_tuples_returned;
-	final->t_tuples_fetched += curr->t_tuples_fetched - save->t_tuples_fetched;
-	final->t_blocks_fetched += curr->t_blocks_fetched - save->t_blocks_fetched;
-	final->t_blocks_hit += curr->t_blocks_hit - save->t_blocks_hit;
+	final->t_numscans = curr->t_numscans - save->t_numscans;
+	final->t_tuples_returned = curr->t_tuples_returned - save->t_tuples_returned;
+	final->t_tuples_fetched = curr->t_tuples_fetched - save->t_tuples_fetched;
+	final->t_blocks_fetched = curr->t_blocks_fetched - save->t_blocks_fetched;
+	final->t_blocks_hit = curr->t_blocks_hit - save->t_blocks_hit;
 
-	if (rel->pgstat_info->trans)
+	final->t_tuples_inserted = curr->t_tuples_inserted;
+	final->t_tuples_updated = curr->t_tuples_updated;
+	final->t_tuples_deleted = curr->t_tuples_deleted;
+
+	/*
+	 * XXX: This is only occasionally correct. Also we ignore the commit/rollback
+	 * state of any of the transactions and always assume commit.
+	 */
+	for (xact = rel->pgstat_info->trans; xact != NULL; xact = xact->upper)
 	{
-		final->t_tuples_inserted += rel->pgstat_info->trans->tuples_inserted - save->t_tuples_inserted;
-		final->t_tuples_updated += rel->pgstat_info->trans->tuples_updated - save->t_tuples_updated;
-		final->t_tuples_deleted += rel->pgstat_info->trans->tuples_deleted - save->t_tuples_deleted;
+		final->t_tuples_inserted += xact->tuples_inserted;
+		final->t_tuples_updated += xact->tuples_updated;
+		final->t_tuples_deleted += xact->tuples_deleted;
 	}
-	else
-	{
-		final->t_tuples_inserted += curr->t_tuples_inserted - save->t_tuples_inserted;
-		final->t_tuples_updated += curr->t_tuples_updated - save->t_tuples_updated;
-		final->t_tuples_deleted += curr->t_tuples_deleted - save->t_tuples_deleted;
-	}
+
+	final->t_tuples_inserted -= save->t_tuples_inserted;
+	final->t_tuples_updated -= save->t_tuples_updated;
+	final->t_tuples_deleted -= save->t_tuples_deleted;
 }
 
 /*
